@@ -1,3 +1,4 @@
+use expanduser::expanduser;
 use openssl::{
     ec, pkey,
     pkey::{Private, Public},
@@ -11,7 +12,7 @@ use std::{
 
 // Constants
 
-const WALLET_PATH: &str = "/tmp/private_key.pem";
+const WALLET_PATH: &str = "~/.config/rs_simple_blockchain/wallet.pem";
 
 const MINIMUM_DIFFICULTY_LEVEL: u8 = 16;
 
@@ -156,13 +157,15 @@ impl Wallet {
 
     fn save_to_disk(self: &Self) -> std::io::Result<()> {
         let pem = self.private_key.private_key_to_pem().unwrap();
-        let mut f = File::create(WALLET_PATH)?;
+        let path = expanduser(WALLET_PATH)?;
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let mut f = File::create(path)?;
         f.write_all(pem.as_slice())
     }
 
     fn load_from_disk() -> Option<Self> {
         fn read() -> std::io::Result<Vec<u8>> {
-            let mut f = File::open(WALLET_PATH)?;
+            let mut f = File::open(expanduser(WALLET_PATH)?)?;
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)?;
             Ok(buf)
