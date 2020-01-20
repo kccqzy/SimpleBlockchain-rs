@@ -1,0 +1,10 @@
+fn_args_layout = "Compressed"
+use_field_init_shorthand = true
+use_small_heuristics = "Max"
+max_width = 120
+
+# Nightly channel only, as of this writing
+fn_single_line = true
+match_arm_blocks = false
+merge_imports = true
+overflow_delimited_expr = true
