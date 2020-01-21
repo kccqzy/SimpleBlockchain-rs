@@ -4,6 +4,7 @@ use openssl::{
     pkey::{Private, Public},
     sha::sha256,
 };
+use rusqlite as sql;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     fs::File,
@@ -63,6 +64,19 @@ pub struct Block {
     transactions: Vec<Transaction>,
     parent_hash: Hash,
     block_hash: Hash,
+}
+
+#[derive(Debug)]
+pub struct BlockchainStorage {
+    path: Option<std::path::PathBuf>,
+    conn: sql::Connection,
+    default_wallet: Wallet,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockchainStats {
+    pub block_count: u64,
+    pub pending_txn_count: u64,
 }
 
 // Impls
@@ -219,6 +233,276 @@ impl Block {
     }
 }
 
+impl BlockchainStorage {
+    fn open_conn(path: Option<&std::path::Path>) -> sql::Connection {
+        let conn = match path {
+            None => sql::Connection::open_in_memory().unwrap(),
+            Some(ref p) => sql::Connection::open(p).unwrap(),
+        };
+        assert!(conn.is_autocommit());
+        conn.execute_batch(
+            "
+                PRAGMA foreign_keys = ON;
+                PRAGMA journal_mode = WAL;
+                CREATE TABLE IF NOT EXISTS blocks (
+                    block_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
+                    parent_hash BLOB REFERENCES blocks (block_hash),
+                    block_height INTEGER NOT NULL DEFAULT 0,
+                    nonce INTEGER NOT NULL,
+                    discovered_at REAL NOT NULL DEFAULT ((julianday('now') - 2440587.5)*86400.0),
+                    CHECK ( block_height >= 0 ),
+                    CHECK ( nonce >= 0 ),
+                    CHECK ( length(block_hash) = 32 OR block_hash = x'deadface' )
+                );
+                CREATE INDEX IF NOT EXISTS block_parent ON blocks (parent_hash);
+                CREATE INDEX IF NOT EXISTS block_height ON blocks (block_height);
+                CREATE INDEX IF NOT EXISTS block_discovered_at ON blocks (discovered_at);
+                CREATE TRIGGER IF NOT EXISTS set_block_height
+                AFTER INSERT ON blocks
+                FOR EACH ROW BEGIN
+                    UPDATE blocks
+                    SET block_height = (SELECT ifnull((SELECT 1 + block_height FROM blocks WHERE block_hash = NEW.parent_hash), 0))
+                    WHERE block_hash = NEW.block_hash;
+                END;
+
+                CREATE TABLE IF NOT EXISTS transactions (
+                    transaction_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
+                    payer BLOB NOT NULL,
+                    payer_hash BLOB NOT NULL,
+                    discovered_at REAL NOT NULL DEFAULT ((julianday('now') - 2440587.5)*86400.0),
+                    signature BLOB NOT NULL,
+                    CHECK ( length(transaction_hash) = 32 ),
+                    CHECK ( length(payer) = 88 ),
+                    CHECK ( length(payer_hash) = 32 )
+                );
+                CREATE INDEX IF NOT EXISTS transaction_payer ON transactions (payer_hash);
+
+                CREATE TABLE IF NOT EXISTS transaction_in_block (
+                    transaction_hash BLOB NOT NULL REFERENCES transactions,
+                    block_hash BLOB NOT NULL REFERENCES blocks ON DELETE CASCADE,
+                    transaction_index INTEGER NOT NULL,
+                    UNIQUE (transaction_hash, block_hash),
+                    UNIQUE (block_hash, transaction_index),
+                    CHECK ( transaction_index BETWEEN 0 AND 1999 )
+                );
+
+                CREATE TABLE IF NOT EXISTS transaction_outputs (
+                    out_transaction_hash BLOB NOT NULL REFERENCES transactions (transaction_hash),
+                    out_transaction_index INTEGER NOT NULL,
+                    amount INTEGER NOT NULL,
+                    recipient_hash BLOB NOT NULL,
+                    PRIMARY KEY (out_transaction_hash, out_transaction_index) ON CONFLICT IGNORE,
+                    UNIQUE (out_transaction_hash, recipient_hash),
+                    CHECK ( amount > 0 ),
+                    CHECK ( out_transaction_index BETWEEN 0 AND 255 ),
+                    CHECK ( length(recipient_hash) = 32 )
+                );
+                CREATE INDEX IF NOT EXISTS output_recipient ON transaction_outputs (recipient_hash);
+
+                CREATE TABLE IF NOT EXISTS transaction_inputs (
+                    in_transaction_hash BLOB NOT NULL REFERENCES transactions (transaction_hash),
+                    in_transaction_index INTEGER NOT NULL,
+                    out_transaction_hash BLOB NOT NULL,
+                    out_transaction_index INTEGER NOT NULL,
+                    PRIMARY KEY (in_transaction_hash, in_transaction_index) ON CONFLICT IGNORE,
+                    FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs DEFERRABLE INITIALLY DEFERRED,
+                    CHECK ( in_transaction_index BETWEEN 0 AND 255 )
+                );
+                CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index);
+
+                CREATE TABLE IF NOT EXISTS trustworthy_wallets (
+                    payer_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
+                    CHECK ( length(payer_hash) = 32 )
+                );
+
+                CREATE VIEW IF NOT EXISTS unauthorized_spending AS
+                SELECT transactions.*, transaction_outputs.recipient_hash AS owner_hash, transaction_outputs.amount
+                FROM transactions
+                JOIN transaction_inputs ON transactions.transaction_hash = transaction_inputs.in_transaction_hash
+                JOIN transaction_outputs USING (out_transaction_hash, out_transaction_index)
+                WHERE payer_hash != owner_hash;
+
+                CREATE VIEW IF NOT EXISTS transaction_credit_debit AS
+                WITH
+                transaction_debits AS (
+                    SELECT out_transaction_hash AS transaction_hash, sum(amount) AS debited_amount
+                    FROM transaction_outputs
+                    GROUP BY transaction_hash
+                ),
+                transaction_credits AS (
+                    SELECT in_transaction_hash AS transaction_hash, sum(transaction_outputs.amount) AS credited_amount
+                    FROM transaction_inputs JOIN transaction_outputs USING (out_transaction_hash, out_transaction_index)
+                    GROUP BY transaction_hash
+                )
+                SELECT * FROM transaction_credits
+                JOIN transaction_debits USING (transaction_hash)
+                JOIN transactions USING (transaction_hash);
+
+                CREATE VIEW IF NOT EXISTS ancestors AS
+                WITH RECURSIVE
+                ancestors AS (
+                    SELECT block_hash, block_hash AS ancestor, 0 AS path_length FROM blocks
+                    UNION ALL
+                    SELECT ancestors.block_hash, blocks.parent_hash AS ancestor, 1 + path_length AS path_length
+                    FROM ancestors JOIN blocks ON ancestor = blocks.block_hash
+                    WHERE blocks.parent_hash IS NOT NULL
+                )
+                SELECT * FROM ancestors;
+
+                CREATE VIEW IF NOT EXISTS longest_chain AS
+                WITH RECURSIVE
+                initial AS (SELECT * FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1),
+                chain AS (
+                    SELECT block_hash, parent_hash, block_height, 1 AS confirmations FROM initial
+                    UNION ALL
+                    SELECT blocks.block_hash, blocks.parent_hash, blocks.block_height, 1 + confirmations
+                        FROM blocks JOIN chain ON blocks.block_hash = chain.parent_hash
+                )
+                SELECT * FROM chain;
+
+                CREATE VIEW IF NOT EXISTS all_tentative_txns AS
+                WITH lc_transaction_in_block AS (
+                    SELECT transaction_in_block.* FROM transaction_in_block JOIN longest_chain USING (block_hash)
+                ),
+                txns_not_on_longest AS (
+                    SELECT transaction_hash, payer, signature, discovered_at
+                    FROM transactions LEFT JOIN lc_transaction_in_block USING (transaction_hash)
+                    WHERE block_hash IS NULL
+                )
+                SELECT * from txns_not_on_longest WHERE transaction_hash IN (SELECT in_transaction_hash FROM transaction_inputs);
+
+                CREATE VIEW IF NOT EXISTS utxo AS
+                WITH tx_confirmations AS (
+                    SELECT transaction_in_block.transaction_hash, longest_chain.confirmations
+                    FROM transaction_in_block JOIN longest_chain USING (block_hash)
+                ),
+                all_utxo AS (
+                    SELECT transaction_outputs.*
+                    FROM transaction_outputs LEFT JOIN transaction_inputs USING (out_transaction_hash, out_transaction_index)
+                    WHERE in_transaction_index IS NULL
+                ),
+                all_utxo_confirmations AS (
+                    SELECT all_utxo.*, ifnull(tx_confirmations.confirmations, 0) AS confirmations
+                    FROM all_utxo LEFT JOIN tx_confirmations ON all_utxo.out_transaction_hash = tx_confirmations.transaction_hash
+                ),
+                trustworthy_even_if_unconfirmed AS (
+                    SELECT transaction_hash
+                    FROM transactions
+                    JOIN trustworthy_wallets USING (payer_hash)
+                    JOIN transaction_inputs ON transactions.transaction_hash = transaction_inputs.in_transaction_hash
+                )
+                SELECT *
+                FROM all_utxo_confirmations
+                WHERE confirmations > 0 OR out_transaction_hash IN (SELECT transaction_hash FROM trustworthy_even_if_unconfirmed);
+
+                CREATE VIEW IF NOT EXISTS block_consistency AS
+                SELECT block_hash AS perspective_block, (
+                   WITH
+                   my_ancestors AS (
+                       SELECT ancestor AS block_hash FROM ancestors WHERE block_hash = ob.block_hash
+                   ),
+                   my_transaction_in_block AS (
+                       SELECT transaction_in_block.* FROM transaction_in_block JOIN my_ancestors USING (block_hash)
+                   ),
+                   my_transaction_inputs AS (
+                       SELECT transaction_inputs.*
+                       FROM transaction_inputs JOIN my_transaction_in_block
+                       ON transaction_inputs.in_transaction_hash = my_transaction_in_block.transaction_hash
+                   ),
+                   my_transaction_outputs AS (
+                       SELECT transaction_outputs.*
+                       FROM transaction_outputs JOIN my_transaction_in_block
+                       ON transaction_outputs.out_transaction_hash = my_transaction_in_block.transaction_hash
+                   ),
+                   error_input_referring_to_nonexistent_outputs AS (
+                       SELECT count(*) AS violations_count
+                       FROM my_transaction_inputs LEFT JOIN my_transaction_outputs USING (out_transaction_hash, out_transaction_index)
+                       WHERE my_transaction_outputs.amount IS NULL
+                   ),
+                   error_double_spent AS (
+                       SELECT count(*) AS violations_count FROM (
+                           SELECT count(*) AS spent_times
+                           FROM my_transaction_outputs JOIN my_transaction_inputs USING (out_transaction_hash, out_transaction_index)
+                           GROUP BY out_transaction_hash, out_transaction_index
+                           HAVING spent_times > 1
+                       )
+                   )
+                   SELECT (SELECT violations_count FROM error_input_referring_to_nonexistent_outputs) +
+                          (SELECT violations_count FROM error_double_spent)
+                ) AS total_violations_count
+                FROM blocks AS ob;").unwrap();
+        conn
+    }
+    pub fn new(path: Option<&std::path::Path>, default_wallet: Option<Wallet>) -> Self {
+        BlockchainStorage {
+            default_wallet: default_wallet.or_else(Wallet::load_from_disk).unwrap_or_else(|| {
+                let w = Wallet::new();
+                w.save_to_disk().unwrap();
+                w
+            }),
+            path: path.map(|p| p.to_path_buf()),
+            conn: BlockchainStorage::open_conn(path),
+        }
+    }
+
+    pub fn recreate_db(self: &mut Self) {
+        fn unlink_ignore_enoent(p: &std::path::Path) -> std::io::Result<()> {
+            std::fs::remove_file(p).or_else(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(e),
+            })
+        }
+        fn add(p: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+            let mut f = p.file_name().unwrap().to_os_string();
+            f.push(suffix);
+            p.with_file_name(f)
+        }
+
+        // First, drop the database. (There's no "invalid" state for the
+        // Connection object so we supply a new, blank connection.)
+        std::mem::replace(&mut self.conn, sql::Connection::open_in_memory().unwrap());
+
+        // Then, unlink all files, if needed and present.
+        if let Some(ref p) = self.path {
+            unlink_ignore_enoent(p).unwrap();
+            unlink_ignore_enoent(&add(p, "-shm")).unwrap();
+            unlink_ignore_enoent(&add(p, "-wal")).unwrap();
+        }
+
+        // Finally, recreate the database on disk.
+        std::mem::replace(&mut self.conn, BlockchainStorage::open_conn(self.path.as_ref().map(|p| p.as_path())));
+    }
+
+    pub fn produce_stats(self: &mut Self) -> sql::Result<BlockchainStats> {
+        let t = self.conn.transaction()?;
+        Ok(BlockchainStats {
+            block_count: {
+                let mut stmt = t.prepare_cached("SELECT 1 + ifnull((SELECT max(block_height) FROM blocks), -1)")?;
+                stmt.query_row(sql::NO_PARAMS, |r| r.get::<_, i64>(0))? as u64
+            },
+            pending_txn_count: {
+                let mut stmt = t.prepare_cached("SELECT count(*) FROM all_tentative_txns")?;
+                stmt.query_row(sql::NO_PARAMS, |r| r.get::<_, i64>(0))? as u64
+            },
+        })
+    }
+
+    pub fn make_wallet_trustworthy(self: &mut Self, h: &Hash) -> sql::Result<()> {
+        let t = self.conn.transaction()?;
+        {
+            let mut stmt = t.prepare_cached("INSERT INTO trustworthy_wallets VALUES (?)")?;
+            stmt.execute(&[&h.0[..]])?;
+        }
+        t.commit()
+    }
+
+    pub fn make_wallet(self: &mut Self) -> sql::Result<Wallet> {
+        let w = Wallet::new();
+        self.make_wallet_trustworthy(&Hash::sha256(&w.public_serialized.0))?;
+        Ok(w)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +545,39 @@ mod tests {
         eprintln!("Block with solved hash challenge: {:?}", b);
         assert_ne!(b.block_hash, Hash::zeroes());
         assert!(b.verify_hash_challenge(16));
+    }
+
+    #[test]
+    fn can_create_bs() {
+        BlockchainStorage::new(None, None);
+        let path = std::path::Path::new("/tmp/storage.db");
+        BlockchainStorage::new(Some(&path), None);
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn can_recreate_db() {
+        let path = std::path::Path::new("/tmp/storage.db");
+        let mut bs = BlockchainStorage::new(Some(&path), None);
+        // TODO add some stuff to the db and later check it's not there
+        bs.recreate_db();
+    }
+
+    #[test]
+    fn can_produce_empty_stats() {
+        let mut bs = BlockchainStorage::new(None, None);
+        assert_eq!(bs.produce_stats().unwrap(), BlockchainStats { pending_txn_count: 0, block_count: 0 });
+    }
+
+    #[test]
+    fn can_create_trustworthy_wallet() {
+        let mut bs = BlockchainStorage::new(None, None);
+        bs.make_wallet().unwrap();
+        assert_eq!(
+            bs.conn
+                .query_row("SELECT count(*) FROM trustworthy_wallets", sql::NO_PARAMS, |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 }
