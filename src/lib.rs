@@ -174,6 +174,17 @@ impl Hash {
         // difficulty would be < 8 and therefore return.
         unreachable!()
     }
+
+    pub fn display_base58(self: &Self) -> String { bs58::encode(&self.0).into_string() }
+
+    pub fn display_hex(self: &Self) -> String {
+        use std::fmt::Write;
+        let mut s = String::new();
+        for &b in self.0.iter() {
+            write!(&mut s, "{:x}", b).unwrap();
+        }
+        s
+    }
 }
 
 impl sql::ToSql for Hash {
@@ -1036,6 +1047,48 @@ impl BlockchainStorage {
             }
         }
         Ok((rv, parent_hash))
+    }
+
+    pub fn get_ui_transaction_by_hash(self: &mut Self, h: &Hash) -> sql::Result<Option<Vec<(String, String)>>> {
+        let t = self.conn.transaction()?; // TODO this ideally would not use a transaction, but a single statement.
+        {
+            let mut stmt = t.prepare_cached("SELECT payer, signature FROM transactions WHERE transaction_hash = ?")?;
+            stmt.query_row(&[h], |row| {
+                BlockchainStorage::fill_transaction_in_out(&t, Transaction {
+                    payer: row.get(0)?,
+                    signature: row.get(1)?,
+                    inputs: vec![],
+                    outputs: vec![],
+                })
+            }).optional()?
+        }.map_or(Ok(None), |tx| {
+            let mut rv = Vec::new();
+                rv.push(("Transaction Hash".to_owned(), h.display_hex()));
+            rv.push(("Originating Wallet".to_owned(), Hash::sha256(&tx.payer.0).display_base58()));
+            for (i, tx_output) in tx.outputs.into_iter().enumerate() {
+                rv.push((format!("Output {} Amount", i), tx_output.amount.to_string()));
+                rv.push((format!("Output {} Recipient", i), tx_output.recipient_hash.display_base58()));
+            }
+            if tx.inputs.is_empty() {
+                rv.push(("Input".to_owned(), "None (this is a miner reward)".to_owned()));
+            }
+            for (i, tx_input) in tx.inputs.into_iter().enumerate() {
+                rv.push((format!("Input {}", i), format!("{}.{}", tx_input.transaction_hash.display_hex(), tx_input.output_index)));
+            }
+            {
+                let mut stmt = t.prepare_cached("SELECT credited_amount, debited_amount FROM transaction_credit_debit WHERE transaction_hash = ?")?;
+                if let Some((cr, db)) = stmt.query_row(&[h], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).optional()? {
+                    rv.push(("Credit Amount".to_owned(), cr.to_string()));
+                    rv.push(("Debit Amount".to_owned(), db.to_string()));
+                }
+            }
+            let conf = {
+                let mut stmt = t.prepare_cached("SELECT ifnull((SELECT longest_chain.confirmations FROM transaction_in_block JOIN longest_chain USING (block_hash) WHERE transaction_hash = ?), 0)")?;
+                stmt.query_row(&[h], |r| r.get::<_, i64>(0))?
+            };
+            rv.push(("Confirmations".to_owned(), conf.to_string()));
+            Ok(Some(rv))
+        })
     }
 }
 
