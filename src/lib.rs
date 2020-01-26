@@ -107,8 +107,20 @@ impl Hash {
     }
 }
 
+impl sql::ToSql for Hash {
+    fn to_sql(self: &Self) -> sql::Result<sql::types::ToSqlOutput> { (&self.0[..]).to_sql() }
+}
+
 impl PayerPublicKey {
     fn check_len(self: &Self) -> bool { self.0.len() == 88 }
+}
+
+impl sql::ToSql for PayerPublicKey {
+    fn to_sql(self: &Self) -> sql::Result<sql::types::ToSqlOutput> { (&self.0[..]).to_sql() }
+}
+
+impl sql::ToSql for Signature {
+    fn to_sql(self: &Self) -> sql::Result<sql::types::ToSqlOutput> { (&self.0[..]).to_sql() }
 }
 
 impl Transaction {
@@ -488,18 +500,45 @@ impl BlockchainStorage {
     }
 
     pub fn make_wallet_trustworthy(self: &mut Self, h: &Hash) -> sql::Result<()> {
-        let t = self.conn.transaction()?;
-        {
-            let mut stmt = t.prepare_cached("INSERT INTO trustworthy_wallets VALUES (?)")?;
-            stmt.execute(&[&h.0[..]])?;
-        }
-        t.commit()
+        let mut stmt = self.conn.prepare_cached("INSERT INTO trustworthy_wallets VALUES (?)")?;
+        stmt.execute(&[&h.0[..]])?;
+        Ok(())
     }
 
     pub fn make_wallet(self: &mut Self) -> sql::Result<Wallet> {
         let w = Wallet::new();
         self.make_wallet_trustworthy(&Hash::sha256(&w.public_serialized.0))?;
         Ok(w)
+    }
+
+    fn insert_raw_transaction(t: &sql::Transaction, txn: &Transaction) -> sql::Result<()> {
+        let txn_hash = txn.transaction_hash();
+        let row_count = {
+            let mut stmt = t.prepare_cached(
+                "INSERT INTO transactions (transaction_hash, payer, payer_hash, signature) VALUES (?,?,?,?)",
+            )?;
+            let params: [&dyn sql::ToSql; 4] = [&txn_hash, &txn.payer, &Hash::sha256(&txn.payer.0), &txn.signature];
+            stmt.execute(&params)?
+        };
+        if row_count > 0 {
+            {
+                let mut stmt = t.prepare_cached("INSERT INTO transaction_outputs VALUES (?,?,?,?)")?;
+                for (index, out) in txn.outputs.iter().enumerate() {
+                    let params: [&dyn sql::ToSql; 4] =
+                        [&txn_hash, &(index as i64), &(out.amount as i64), &out.recipient_hash];
+                    stmt.execute(&params)?;
+                }
+            }
+            {
+                let mut stmt = t.prepare_cached("INSERT INTO transaction_inputs VALUES (?,?,?,?)")?;
+                for (index, inp) in txn.inputs.iter().enumerate() {
+                    let params: [&dyn sql::ToSql; 4] =
+                        [&txn_hash, &(index as i64), &inp.transaction_hash, &(inp.output_index)];
+                    stmt.execute(&params)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
