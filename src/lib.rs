@@ -9,6 +9,7 @@ use serde_derive::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Write},
+    iter::FromIterator,
 };
 
 // Constants
@@ -117,6 +118,19 @@ impl Hash {
 
 impl sql::ToSql for Hash {
     fn to_sql(self: &Self) -> sql::Result<sql::types::ToSqlOutput> { (&self.0[..]).to_sql() }
+}
+
+impl sql::types::FromSql for Hash {
+    fn column_result(value: sql::types::ValueRef) -> sql::types::FromSqlResult<Self> {
+        let val: Vec<u8> = sql::types::FromSql::column_result(value)?;
+        if val.len() == 32 {
+            let mut arr = [0; 32];
+            arr.copy_from_slice(&val[..32]);
+            Ok(Hash(arr))
+        } else {
+            Err(sql::types::FromSqlError::InvalidType)
+        }
+    }
 }
 
 impl PayerPublicKey {
@@ -498,6 +512,9 @@ impl BlockchainStorage {
     }
 
     pub fn produce_stats(self: &mut Self) -> sql::Result<BlockchainStats> {
+        // Conceptually this shouldn't need to take a mutable reference to self.
+        // But it's just easier to write this way while guaranteeing both stats
+        // are consistent. TODO Maybe refactor.
         let t = self.conn.transaction()?;
         Ok(BlockchainStats {
             block_count: {
@@ -656,9 +673,7 @@ impl BlockchainStorage {
         Ok(())
     }
 
-    fn receive_tentative_transaction_internal(
-        t: &sql::Transaction, ts: &Vec<Transaction>,
-    ) -> Result<(), BlockchainError> {
+    fn receive_tentative_transaction_internal(t: &sql::Transaction, ts: &[Transaction]) -> Result<(), BlockchainError> {
         fn err(msg: &'static str) -> Result<(), BlockchainError> {
             Err(BlockchainError::InvalidReceivedTentativeTxn(msg))
         }
@@ -705,7 +720,7 @@ impl BlockchainStorage {
         Ok(())
     }
 
-    pub fn receive_tentative_transaction(self: &mut Self, ts: &Vec<Transaction>) -> Result<(), BlockchainError> {
+    pub fn receive_tentative_transaction(self: &mut Self, ts: &[Transaction]) -> Result<(), BlockchainError> {
         fn report_integrity(e: sql::Error) -> BlockchainError {
             if let sql::Error::SqliteFailure(
                 libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, .. },
@@ -722,6 +737,21 @@ impl BlockchainStorage {
         BlockchainStorage::receive_tentative_transaction_internal(&t, ts)?;
         t.commit().map_err(report_integrity)?;
         Ok(())
+    }
+
+    pub fn find_available_spend<V: FromIterator<(TransactionInput, u64)>>(
+        self: &Self, wallet_public_key_hash: &Hash,
+    ) -> sql::Result<V> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT out_transaction_hash, out_transaction_index, amount FROM utxo WHERE recipient_hash = ?",
+        )?;
+        let rows = stmt.query_map(&[wallet_public_key_hash], |row| {
+            Ok((
+                TransactionInput { transaction_hash: row.get(0)?, output_index: (row.get(1)?) },
+                (row.get::<_, i64>(2)?) as u64,
+            ))
+        })?;
+        rows.collect()
     }
 }
 
