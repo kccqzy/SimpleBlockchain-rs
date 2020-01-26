@@ -19,6 +19,7 @@ const MINIMUM_DIFFICULTY_LEVEL: u8 = 16;
 
 const COIN: u64 = 1_0000_0000;
 const BLOCK_REWARD: u64 = 10 * COIN;
+const MAX_MONEY: u64 = 100_000_000_000 * COIN;
 
 // Types
 
@@ -544,7 +545,7 @@ impl BlockchainStorage {
                 let mut stmt = t.prepare_cached("INSERT INTO transaction_inputs VALUES (?,?,?,?)")?;
                 for (index, inp) in txn.inputs.iter().enumerate() {
                     let params: [&dyn sql::ToSql; 4] =
-                        [&txn_hash, &(index as i64), &inp.transaction_hash, &(inp.output_index)];
+                        [&txn_hash, &(index as i64), &inp.transaction_hash, &inp.output_index];
                     stmt.execute(&params)?;
                 }
             }
@@ -589,6 +590,10 @@ impl BlockchainStorage {
 
         if !block.transactions.iter().skip(1).all(|t| 1 <= t.inputs.len() && t.inputs.len() <= 256) {
             err("Every transaction except for the first must have at least one input and at most 256")?;
+        }
+
+        if !block.transactions.iter().all(|t| t.outputs.iter().all(|o| o.amount <= MAX_MONEY)) {
+            err("Every output of every transaction must have a value of no more than 100 billion")?;
         }
 
         if !block.transactions.iter().all(|t| {
@@ -636,7 +641,7 @@ impl BlockchainStorage {
         {
             let mut stmt = t.prepare_cached("SELECT count(*) FROM transaction_credit_debit JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? AND debited_amount > credited_amount")?;
             if stmt.query_row(&[&block.block_hash], |r| r.get::<_, i64>(0))? > 0 {
-                err("Transaction(s) in block spend more than they have")?;
+                err("Transaction(s) in block have an input that spends more than the amount in the referenced output")?;
             }
         }
         {
@@ -647,6 +652,74 @@ impl BlockchainStorage {
             }
         }
 
+        t.commit().map_err(report_integrity)?;
+        Ok(())
+    }
+
+    fn receive_tentative_transaction_internal(
+        t: &sql::Transaction, ts: &Vec<Transaction>,
+    ) -> Result<(), BlockchainError> {
+        fn err(msg: &'static str) -> Result<(), BlockchainError> {
+            Err(BlockchainError::InvalidReceivedTentativeTxn(msg))
+        }
+
+        if !ts
+            .iter()
+            .all(|t| 1 <= t.outputs.len() && t.outputs.len() <= 256 && 1 <= t.inputs.len() && t.inputs.len() <= 256)
+        {
+            err("Tentative transaction(s) must each have at least one input and one output, and at most 256")?;
+        }
+
+        if !ts.iter().all(|t| t.outputs.iter().all(|o| o.amount <= MAX_MONEY)) {
+            err("Every output of every tentative transaction must have a value of no more than 100 billion")?;
+        }
+
+        if !ts.iter().all(|t| {
+            t.outputs.len()
+                == t.outputs.iter().map(|o| &o.recipient_hash).collect::<std::collections::HashSet<_>>().len()
+        }) {
+            err("Tentative transaction(s) must each have distinct output recipients")?;
+        }
+
+        if !ts.iter().all(Transaction::verify_signature) {
+            err("Tentative transaction(s) must be correctly signed")?;
+        }
+
+        for tx in ts {
+            BlockchainStorage::insert_transaction_raw(t, tx)?;
+            let th = tx.transaction_hash();
+            {
+                let mut stmt =
+                    t.prepare_cached("SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?")?;
+                if stmt.query_row(&[&th], |r| r.get::<_, i64>(0))? > 0 {
+                    err("Tentative transaction(s) contain unauthorized spending")?;
+                }
+            }
+            {
+                let mut stmt = t.prepare_cached("SELECT count(*) FROM transaction_credit_debit WHERE transaction_hash = ? AND debited_amount > credited_amount")?;
+                if stmt.query_row(&[&th], |r| r.get::<_, i64>(0))? > 0 {
+                    err("Tentative transaction(s) have an input that spends more than the amount in the referenced output")?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn receive_tentative_transaction(self: &mut Self, ts: &Vec<Transaction>) -> Result<(), BlockchainError> {
+        fn report_integrity(e: sql::Error) -> BlockchainError {
+            if let sql::Error::SqliteFailure(
+                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, .. },
+                _,
+            ) = e
+            {
+                BlockchainError::InvalidReceivedBlock("Tentative transaction(s) do not abide by all rules")
+            } else {
+                BlockchainError::DatabaseError(e)
+            }
+        }
+
+        let t = self.conn.transaction()?;
+        BlockchainStorage::receive_tentative_transaction_internal(&t, ts)?;
         t.commit().map_err(report_integrity)?;
         Ok(())
     }
