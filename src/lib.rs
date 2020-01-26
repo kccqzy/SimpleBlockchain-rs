@@ -753,6 +753,24 @@ impl BlockchainStorage {
         })?;
         rows.collect()
     }
+
+    pub fn find_wallet_balance(
+        self: &Self, wallet_public_key_hash: &Hash, required_confirmations: Option<u32>,
+    ) -> sql::Result<u64> {
+        Ok((match required_confirmations {
+            None => {
+                let mut stmt = self.conn.prepare_cached("SELECT sum(amount) FROM utxo WHERE recipient_hash = ?")?;
+                stmt.query_row(&[&wallet_public_key_hash], |r| r.get::<_, i64>(0))?
+            }
+            Some(conf) => {
+                let mut stmt = self
+                    .conn
+                    .prepare_cached("SELECT sum(amount) FROM utxo WHERE recipient_hash = ? AND confirmations >= ?")?;
+                let params: [&dyn sql::ToSql; 2] = [&wallet_public_key_hash, &conf];
+                stmt.query_row(&params, |r| r.get::<_, i64>(0))?
+            }
+        }) as u64)
+    }
 }
 
 #[cfg(test)]
