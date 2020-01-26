@@ -5,11 +5,11 @@ use openssl::{
     sha::sha256,
 };
 use rusqlite as sql;
+use rusqlite::OptionalExtension;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Write},
-    iter::FromIterator,
 };
 
 // Constants
@@ -86,6 +86,7 @@ pub enum BlockchainError {
     DatabaseError(sql::Error),
     InvalidReceivedBlock(&'static str),
     InvalidReceivedTentativeTxn(&'static str),
+    InsufficientBalance { requested_amount: u64, available_amount: u64 },
 }
 
 // Impls
@@ -141,8 +142,20 @@ impl sql::ToSql for PayerPublicKey {
     fn to_sql(self: &Self) -> sql::Result<sql::types::ToSqlOutput> { (&self.0[..]).to_sql() }
 }
 
+impl sql::types::FromSql for PayerPublicKey {
+    fn column_result(value: sql::types::ValueRef) -> sql::types::FromSqlResult<Self> {
+        sql::types::FromSql::column_result(value).map(PayerPublicKey)
+    }
+}
+
 impl sql::ToSql for Signature {
     fn to_sql(self: &Self) -> sql::Result<sql::types::ToSqlOutput> { (&self.0[..]).to_sql() }
+}
+
+impl sql::types::FromSql for Signature {
+    fn column_result(value: sql::types::ValueRef) -> sql::types::FromSqlResult<Self> {
+        sql::types::FromSql::column_result(value).map(Signature)
+    }
 }
 
 impl Transaction {
@@ -278,6 +291,7 @@ impl BlockchainStorage {
             Some(ref p) => sql::Connection::open(p).unwrap(),
         };
         assert!(conn.is_autocommit());
+        conn.set_prepared_statement_cache_capacity(64);
         conn.execute_batch(
             "
                 PRAGMA foreign_keys = ON;
@@ -528,7 +542,7 @@ impl BlockchainStorage {
         })
     }
 
-    pub fn make_wallet_trustworthy(self: &mut Self, h: &Hash) -> sql::Result<()> {
+    pub fn make_wallet_trustworthy(self: &Self, h: &Hash) -> sql::Result<()> {
         let mut stmt = self.conn.prepare_cached("INSERT INTO trustworthy_wallets VALUES (?)")?;
         stmt.execute(&[&h.0[..]])?;
         Ok(())
@@ -673,7 +687,9 @@ impl BlockchainStorage {
         Ok(())
     }
 
-    fn receive_tentative_transaction_internal(t: &sql::Transaction, ts: &[Transaction]) -> Result<(), BlockchainError> {
+    fn receive_tentative_transaction_internal(
+        t: &sql::Transaction, ts: &[&Transaction],
+    ) -> Result<(), BlockchainError> {
         fn err(msg: &'static str) -> Result<(), BlockchainError> {
             Err(BlockchainError::InvalidReceivedTentativeTxn(msg))
         }
@@ -696,7 +712,7 @@ impl BlockchainStorage {
             err("Tentative transaction(s) must each have distinct output recipients")?;
         }
 
-        if !ts.iter().all(Transaction::verify_signature) {
+        if !ts.iter().all(|t| t.verify_signature()) {
             err("Tentative transaction(s) must be correctly signed")?;
         }
 
@@ -720,7 +736,7 @@ impl BlockchainStorage {
         Ok(())
     }
 
-    pub fn receive_tentative_transaction(self: &mut Self, ts: &[Transaction]) -> Result<(), BlockchainError> {
+    pub fn receive_tentative_transaction(self: &mut Self, ts: &[&Transaction]) -> Result<(), BlockchainError> {
         fn report_integrity(e: sql::Error) -> BlockchainError {
             if let sql::Error::SqliteFailure(
                 libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, .. },
@@ -739,10 +755,10 @@ impl BlockchainStorage {
         Ok(())
     }
 
-    pub fn find_available_spend<V: FromIterator<(TransactionInput, u64)>>(
-        self: &Self, wallet_public_key_hash: &Hash,
-    ) -> sql::Result<V> {
-        let mut stmt = self.conn.prepare_cached(
+    fn find_available_spend(
+        t: &sql::Transaction, wallet_public_key_hash: &Hash,
+    ) -> sql::Result<impl Iterator<Item = (TransactionInput, u64)>> {
+        let mut stmt = t.prepare_cached(
             "SELECT out_transaction_hash, out_transaction_index, amount FROM utxo WHERE recipient_hash = ?",
         )?;
         let rows = stmt.query_map(&[wallet_public_key_hash], |row| {
@@ -751,7 +767,11 @@ impl BlockchainStorage {
                 row.get::<_, i64>(2)? as u64,
             ))
         })?;
-        rows.collect()
+        Ok(rows.collect::<sql::Result<Vec<_>>>()?.into_iter())
+        // NOTE that we have to collect it into a Vec or some other
+        // container and finish consuming the entire mapped rows; this is
+        // because if any future element is an Err, we return Err without
+        // giving any item.
     }
 
     pub fn find_wallet_balance(
@@ -771,6 +791,112 @@ impl BlockchainStorage {
             }
         })
         .unwrap_or(0) as u64)
+    }
+
+    pub fn create_simple_transaction(
+        self: &mut Self, wallet: Option<&Wallet>, requested_amount: u64, recipient_hash: &Hash,
+    ) -> Result<Transaction, BlockchainError> {
+        let wallet = wallet.unwrap_or(&self.default_wallet);
+        let wallet_hash = Hash::sha256(&wallet.public_serialized.0);
+
+        self.make_wallet_trustworthy(&wallet_hash)?; // We have the private key of this wallet so it is trustworthy.
+
+        let t = self.conn.transaction()?;
+        let result = BlockchainStorage::find_available_spend(&t, &wallet_hash)?.try_fold(
+            (Vec::new(), 0),
+            |(inputs, sum), (ti, amt)| {
+                let mut new_inputs = inputs;
+                new_inputs.push(ti);
+                let rv = (new_inputs, sum + amt);
+                if rv.1 >= requested_amount {
+                    Err(rv)
+                } else {
+                    Ok(rv)
+                }
+            },
+        );
+        match result {
+            Ok((_, available_amount)) =>
+                Err(BlockchainError::InsufficientBalance { available_amount, requested_amount }),
+            Err((inputs, total_amount)) => {
+                let outputs = if wallet_hash != *recipient_hash {
+                    let mut o =
+                        vec![TransactionOutput { amount: requested_amount, recipient_hash: recipient_hash.clone() }];
+                    if total_amount > requested_amount {
+                        o.push(TransactionOutput {
+                            amount: total_amount - requested_amount,
+                            recipient_hash: wallet_hash,
+                        });
+                    }
+                    o
+                } else {
+                    vec![TransactionOutput { amount: total_amount, recipient_hash: recipient_hash.clone() }]
+                };
+                let txn = wallet.create_raw_transaction(inputs, outputs);
+                BlockchainStorage::receive_tentative_transaction_internal(&t, &[&txn])?;
+                t.commit()?;
+                Ok(txn)
+            }
+        }
+    }
+
+    pub fn get_longest_chain(self: &Self) -> sql::Result<impl Iterator<Item = (Hash, u64)>> {
+        let mut stmt = self.conn.prepare_cached("SELECT block_hash, block_height FROM longest_chain")?;
+        let rows = stmt.query_map(sql::NO_PARAMS, |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))?;
+        Ok(rows.collect::<sql::Result<Vec<_>>>()?.into_iter())
+    }
+
+    fn fill_transaction_in_out(t: &sql::Transaction, tx: Transaction) -> sql::Result<Transaction> {
+        let th = tx.transaction_hash();
+        let inputs = {
+            let mut stmt = t.prepare_cached("SELECT out_transaction_hash, out_transaction_index FROM transaction_inputs WHERE in_transaction_hash = ? ORDER BY in_transaction_index")?;
+            let rows = stmt.query_map(&[&th], |row| {
+                Ok(TransactionInput { transaction_hash: row.get(0)?, output_index: row.get(1)? })
+            })?;
+            rows.collect::<sql::Result<Vec<_>>>()?
+        };
+        let outputs = {
+            let mut stmt = t.prepare_cached("SELECT amount, recipient_hash FROM transaction_outputs WHERE out_transaction_hash = ? ORDER BY out_transaction_index")?;
+            let rows = stmt.query_map(&[&th], |row| {
+                Ok(TransactionOutput { amount: row.get::<_, i64>(0)? as u64, recipient_hash: row.get(1)? })
+            })?;
+            rows.collect::<sql::Result<Vec<_>>>()?
+        };
+        Ok(Transaction { inputs, outputs, ..tx })
+    }
+
+    pub fn get_block_by_hash(self: &mut Self, block_hash: &Hash) -> sql::Result<Option<Block>> {
+        let t = self.conn.transaction()?;
+        {
+            let mut stmt =
+                t.prepare_cached("SELECT nonce, parent_hash, block_hash FROM blocks WHERE block_hash = ?")?;
+            stmt.query_row(&[&block_hash], |row| {
+                Ok(Block {
+                    nonce: row.get::<_, i64>(0)? as u64,
+                    transactions: vec![],
+                    parent_hash: row.get(1)?,
+                    block_hash: row.get(2)?,
+                })
+            })
+            .optional()
+        }?
+        .map_or(Ok(None), |b| {
+            Ok(Some(Block {
+                transactions: {
+                    let mut stmt = t.prepare_cached("SELECT payer, signature FROM transactions JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? ORDER BY transaction_index")?;
+                    let rows = stmt.query_map(&[block_hash], |row| {
+                        BlockchainStorage::fill_transaction_in_out(&t, Transaction {
+                            payer: row.get(0)?,
+                            signature: row.get(1)?,
+                            inputs: vec![],
+                            outputs: vec![],
+                        })
+                    })?;
+                    rows.collect::<sql::Result<Vec<_>>>()?
+                },
+                ..b
+            }))
+        })
     }
 }
 
@@ -854,8 +980,9 @@ mod tests {
 
     #[test]
     fn initial_default_wallet_zero_balance() {
-        let bs = BlockchainStorage::new(None, None);
+        let mut bs = BlockchainStorage::new(None, None);
         let h = Hash::sha256(&bs.default_wallet.public_serialized.0);
         assert_eq!(bs.find_wallet_balance(&h, None).unwrap(), 0);
+        assert_eq!(BlockchainStorage::find_available_spend(&bs.conn.transaction().unwrap(), &h).unwrap().count(), 0);
     }
 }
