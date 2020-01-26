@@ -22,7 +22,7 @@ const BLOCK_REWARD: u64 = 10 * COIN;
 
 // Types
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Hash([u8; 32]);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +62,7 @@ pub struct Wallet {
 pub struct Block {
     nonce: u64,
     transactions: Vec<Transaction>,
-    parent_hash: Hash,
+    parent_hash: Hash, // TODO refactor into Option
     block_hash: Hash,
 }
 
@@ -77,6 +77,13 @@ pub struct BlockchainStorage {
 pub struct BlockchainStats {
     pub block_count: u64,
     pub pending_txn_count: u64,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum BlockchainError {
+    DatabaseError(sql::Error),
+    InvalidReceivedBlock(&'static str),
+    InvalidReceivedTentativeTxn(&'static str),
 }
 
 // Impls
@@ -243,6 +250,10 @@ impl Block {
             }])],
         }
     }
+}
+
+impl std::convert::From<sql::Error> for BlockchainError {
+    fn from(error: sql::Error) -> Self { BlockchainError::DatabaseError(error) }
 }
 
 impl BlockchainStorage {
@@ -511,7 +522,7 @@ impl BlockchainStorage {
         Ok(w)
     }
 
-    fn insert_raw_transaction(t: &sql::Transaction, txn: &Transaction) -> sql::Result<()> {
+    fn insert_transaction_raw(t: &sql::Transaction, txn: &Transaction) -> sql::Result<()> {
         let txn_hash = txn.transaction_hash();
         let row_count = {
             let mut stmt = t.prepare_cached(
@@ -538,6 +549,105 @@ impl BlockchainStorage {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn receive_block(self: &mut Self, block: &Block) -> Result<(), BlockchainError> {
+        fn err(msg: &'static str) -> Result<(), BlockchainError> { Err(BlockchainError::InvalidReceivedBlock(msg)) }
+
+        fn report_integrity(e: sql::Error) -> BlockchainError {
+            if let sql::Error::SqliteFailure(
+                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, .. },
+                _,
+            ) = e
+            {
+                BlockchainError::InvalidReceivedBlock("Block contains transactions that do not abide by all rules")
+            } else {
+                BlockchainError::DatabaseError(e)
+            }
+        }
+
+        if block.transactions.len() > 2000 {
+            err("A block may have at most 2000 transactions")?;
+        }
+
+        if block.nonce >= 1 << 63 {
+            err("Block nonce must be within 63 bits")?;
+        }
+
+        if block.transactions.len() == 0
+            || block.transactions[0].inputs.len() != 0
+            || block.transactions[0].outputs.len() != 1
+            || block.transactions[0].outputs[0].amount != BLOCK_REWARD
+        {
+            err("The first transaction must be a reward transaction: have no inputs, and only one output of exactly the reward amount")?;
+        }
+
+        if !block.transactions.iter().all(|t| 1 <= t.outputs.len() && t.outputs.len() <= 256) {
+            err("Every transaction must have at least one output and at most 256")?;
+        }
+
+        if !block.transactions.iter().skip(1).all(|t| 1 <= t.inputs.len() && t.inputs.len() <= 256) {
+            err("Every transaction except for the first must have at least one input and at most 256")?;
+        }
+
+        if !block.transactions.iter().all(|t| {
+            t.outputs.len()
+                == t.outputs.iter().map(|o| &o.recipient_hash).collect::<std::collections::HashSet<_>>().len()
+        }) {
+            err("Every transaction must have distinct output recipients")?;
+        }
+
+        if !block.verify_hash_challenge(MINIMUM_DIFFICULTY_LEVEL) {
+            err("Block has incorrect or insufficiently hard hash")?;
+        }
+
+        if !block.transactions.iter().all(Transaction::verify_signature) {
+            err("Every transaction must be correctly signed")?;
+        }
+
+        let t = self.conn.transaction()?;
+
+        {
+            let mut stmt = t.prepare_cached("INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (?,?,?)")?;
+            let params: [&dyn sql::ToSql; 3] = [
+                &block.block_hash,
+                if block.parent_hash != Hash::zeroes() { &block.parent_hash } else { &sql::types::Null },
+                &(block.nonce as i64),
+            ];
+            stmt.execute(&params).map_err(report_integrity)?;
+        }
+        for txn in block.transactions.iter() {
+            BlockchainStorage::insert_transaction_raw(&t, &txn).map_err(report_integrity)?;
+        }
+        {
+            let mut stmt = t.prepare_cached("INSERT INTO transaction_in_block VALUES (?,?,?)")?;
+            for (index, txn) in block.transactions.iter().enumerate() {
+                let params: [&dyn sql::ToSql; 3] = [&txn.transaction_hash(), &block.block_hash, &(index as i64)];
+                stmt.execute(&params).map_err(report_integrity)?;
+            }
+        }
+        {
+            let mut stmt = t.prepare_cached("SELECT count(*) FROM unauthorized_spending JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ?")?;
+            if stmt.query_row(&[&block.block_hash], |r| r.get::<_, i64>(0))? > 0 {
+                err("Transaction(s) in block contain unauthorized spending")?;
+            }
+        }
+        {
+            let mut stmt = t.prepare_cached("SELECT count(*) FROM transaction_credit_debit JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? AND debited_amount > credited_amount")?;
+            if stmt.query_row(&[&block.block_hash], |r| r.get::<_, i64>(0))? > 0 {
+                err("Transaction(s) in block spend more than they have")?;
+            }
+        }
+        {
+            let mut stmt =
+                t.prepare_cached("SELECT total_violations_count FROM block_consistency WHERE perspective_block = ?")?;
+            if stmt.query_row(&[&block.block_hash], |r| r.get::<_, i64>(0))? > 0 {
+                err("Transaction(s) in block are not consistent with ancestor blocks; one or more transactions either refer to a nonexistent parent or double spend a previously spent parent")?;
+            }
+        }
+
+        t.commit().map_err(report_integrity)?;
         Ok(())
     }
 }

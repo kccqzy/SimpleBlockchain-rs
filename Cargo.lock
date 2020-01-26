@@ -364,6 +364,7 @@ version = "0.1.0"
 dependencies = [
  "bincode 1.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "expanduser 1.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libsqlite3-sys 0.17.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "openssl 0.10.26 (registry+https://github.com/rust-lang/crates.io-index)",
  "rusqlite 0.21.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde 1.0.104 (registry+https://github.com/rust-lang/crates.io-index)",
