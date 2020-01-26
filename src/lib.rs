@@ -898,6 +898,20 @@ impl BlockchainStorage {
             }))
         })
     }
+
+    pub fn get_all_tentative_transactions(self: &mut Self) -> sql::Result<Vec<Transaction>> {
+        let t = self.conn.transaction()?;
+        let mut stmt = t.prepare_cached("SELECT payer, signature FROM all_tentative_txns")?;
+        let rows = stmt.query_map(sql::NO_PARAMS, |row| {
+            BlockchainStorage::fill_transaction_in_out(&t, Transaction {
+                payer: row.get(0)?,
+                signature: row.get(1)?,
+                inputs: vec![],
+                outputs: vec![],
+            })
+        })?;
+        rows.collect::<sql::Result<Vec<_>>>()
+    }
 }
 
 #[cfg(test)]
