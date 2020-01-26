@@ -912,6 +912,66 @@ impl BlockchainStorage {
         })?;
         rows.collect::<sql::Result<Vec<_>>>()
     }
+
+    pub fn get_mineable_tentative_transactions(self: &mut Self, limit: Option<u16>) -> sql::Result<(Vec<Transaction>, Option<Hash>)> {
+        // We need to temporarily modify the database inside the transaction to
+        // check for validity. We will not actually make any modifications to
+        // the DB.
+        let mut t = self.conn.transaction()?;
+        let mut rv = Vec::new();
+        let limit = limit.unwrap_or(100);
+
+        // Find a parent hash.
+        let parent_hash = {
+            let mut stmt = t.prepare_cached("SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1")?;
+            stmt.query_row(sql::NO_PARAMS, |r| r.get(0)).optional()?
+        };
+        {
+            let mut stmt = t.prepare_cached("INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (x'deadface', ?, 0)")?;
+            stmt.execute(&[&parent_hash])?;
+        }
+
+        while rv.len() < limit as usize {
+            let all_tentative_txns : Vec<(Hash, PayerPublicKey, Signature)>= {
+                let mut stmt = t.prepare_cached("SELECT transaction_hash, payer, signature FROM all_tentative_txns ORDER BY discovered_at ASC LIMIT ?")?;
+                let rows = stmt.query_map(&[&(limit - (rv.len() as u16))], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+                rows.collect::<sql::Result<Vec<_>>>()?
+            };
+            if all_tentative_txns.is_empty() {
+                break; // Found all tentative txns.
+            }
+            let mut progress = false;
+            for (h, p, s) in all_tentative_txns.into_iter() {
+                let mut sp = t.savepoint()?;
+                {
+                    let mut stmt = sp.prepare_cached("INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, x'deadface', ?)")?;
+                    let params: [&dyn sql::ToSql; 2] = [&h, &(rv.len() as u16)];
+                    stmt.execute(&params)?;
+                }
+                let violations_count : i64 = {
+                    let mut stmt = sp.prepare_cached("SELECT total_violations_count FROM block_consistency WHERE perspective_block = x'deadface'")?;
+                    stmt.query_row(sql::NO_PARAMS, |r| r.get(0))?
+                };
+                if violations_count > 0 {
+                    sp.rollback()?
+                } else {
+                    sp.commit()?;
+                    progress = true;
+                    rv.push(BlockchainStorage::fill_transaction_in_out(&t, Transaction{
+                        payer: p,
+                        signature: s,
+                        inputs: vec![], outputs: vec![]
+                    })?);
+                }
+            }
+            if !progress {
+                // None of the remaining tentative transactions can be added to
+                // the block (i.e. compatible with the block).
+                break
+            }
+        }
+        Ok((rv, parent_hash))
+    }
 }
 
 #[cfg(test)]
@@ -998,5 +1058,12 @@ mod tests {
         let h = Hash::sha256(&bs.default_wallet.public_serialized.0);
         assert_eq!(bs.find_wallet_balance(&h, None).unwrap(), 0);
         assert_eq!(BlockchainStorage::find_available_spend(&bs.conn.transaction().unwrap(), &h).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn initial_no_tentative_txns() {
+        let mut bs = BlockchainStorage::new(None, None);
+        assert!(bs.get_all_tentative_transactions().unwrap().is_empty());
+        assert!(bs.get_mineable_tentative_transactions(None).unwrap().0.is_empty());
     }
 }
