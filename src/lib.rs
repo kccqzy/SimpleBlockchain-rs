@@ -747,8 +747,8 @@ impl BlockchainStorage {
         )?;
         let rows = stmt.query_map(&[wallet_public_key_hash], |row| {
             Ok((
-                TransactionInput { transaction_hash: row.get(0)?, output_index: (row.get(1)?) },
-                (row.get::<_, i64>(2)?) as u64,
+                TransactionInput { transaction_hash: row.get(0)?, output_index: row.get(1)? },
+                row.get::<_, i64>(2)? as u64,
             ))
         })?;
         rows.collect()
@@ -760,16 +760,17 @@ impl BlockchainStorage {
         Ok((match required_confirmations {
             None => {
                 let mut stmt = self.conn.prepare_cached("SELECT sum(amount) FROM utxo WHERE recipient_hash = ?")?;
-                stmt.query_row(&[&wallet_public_key_hash], |r| r.get::<_, i64>(0))?
+                stmt.query_row(&[&wallet_public_key_hash], |r| r.get::<_, Option<i64>>(0))?
             }
             Some(conf) => {
                 let mut stmt = self
                     .conn
                     .prepare_cached("SELECT sum(amount) FROM utxo WHERE recipient_hash = ? AND confirmations >= ?")?;
                 let params: [&dyn sql::ToSql; 2] = [&wallet_public_key_hash, &conf];
-                stmt.query_row(&params, |r| r.get::<_, i64>(0))?
+                stmt.query_row(&params, |r| r.get::<_, Option<i64>>(0))?
             }
-        }) as u64)
+        })
+        .unwrap_or(0) as u64)
     }
 }
 
@@ -849,5 +850,12 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn initial_default_wallet_zero_balance() {
+        let bs = BlockchainStorage::new(None, None);
+        let h = Hash::sha256(&bs.default_wallet.public_serialized.0);
+        assert_eq!(bs.find_wallet_balance(&h, None).unwrap(), 0);
     }
 }
