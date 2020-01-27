@@ -16,7 +16,7 @@ use std::{
 
 const WALLET_PATH: &str = "~/.config/rs_simple_blockchain/wallet.pem";
 
-const MINIMUM_DIFFICULTY_LEVEL: u8 = 16;
+const MINIMUM_DIFFICULTY_LEVEL: u8 = 12;
 
 // Types
 
@@ -52,11 +52,11 @@ pub struct Transaction {
     signature: Signature,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Wallet {
     public_serialized: PayerPublicKey,
+    public_hash: Hash,
     private_key: ec::EcKey<Private>,
-    public_key: ec::EcKey<Public>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,8 +83,8 @@ pub struct BlockchainStats {
 #[derive(Debug, PartialEq)]
 pub enum BlockchainError {
     DatabaseError(sql::Error),
-    InvalidReceivedBlock(&'static str),
-    InvalidReceivedTentativeTxn(&'static str),
+    InvalidReceivedBlock(&'static str, Option<&'static str>),
+    InvalidReceivedTentativeTxn(&'static str, Option<&'static str>),
     InsufficientBalance { requested_amount: Amount, available_amount: Amount },
     MonetaryAmountTooLarge(),
 }
@@ -257,12 +257,10 @@ impl Wallet {
         let ecg = privkey.group();
         let correct_type = ecg.curve_name().map_or(false, |nid| nid == openssl::nid::Nid::SECP256K1);
         assert!(correct_type);
-        let pubkey = ec::EcKey::from_public_key(ecg, privkey.public_key())?;
-        Ok(Wallet {
-            private_key: privkey,
-            public_key: pubkey.clone(),
-            public_serialized: PayerPublicKey(pkey::PKey::from_ec_key(pubkey)?.public_key_to_der()?),
-        })
+        let pubkey: ec::EcKey<Public> = ec::EcKey::from_public_key(ecg, privkey.public_key())?;
+        let public_serialized = PayerPublicKey(pkey::PKey::from_ec_key(pubkey)?.public_key_to_der()?);
+        let public_hash = Hash::sha256(&public_serialized.0);
+        Ok(Wallet { private_key: privkey, public_serialized, public_hash })
     }
 
     pub fn new() -> Self {
@@ -270,6 +268,8 @@ impl Wallet {
         let privkey = ec::EcKey::generate(ecg.as_ref()).unwrap();
         Wallet::from_privkey(privkey).unwrap()
     }
+
+    pub fn public_key_hash(self: &Self) -> &Hash { &self.public_hash }
 
     fn create_raw_transaction(
         self: &Self, inputs: Vec<TransactionInput>, outputs: Vec<TransactionOutput>,
@@ -331,10 +331,8 @@ impl Block {
         false
     }
 
-    pub fn verify_difficulty(self: &Self, difficulty: u8) -> bool { self.block_hash.has_difficulty(difficulty) }
-
     pub fn verify_hash_challenge(self: &Self, difficulty: u8) -> bool {
-        self.verify_difficulty(difficulty) && self.block_hash == Hash::sha256(&self.to_hash_challenge())
+        self.block_hash.has_difficulty(difficulty) && self.block_hash == Hash::sha256(&self.to_hash_challenge())
     }
 
     fn new_mine_block(w: &Wallet) -> Self {
@@ -555,9 +553,9 @@ impl BlockchainStorage {
                 FROM blocks AS ob;").unwrap();
         conn
     }
-    pub fn new(path: Option<&std::path::Path>, default_wallet: Option<Wallet>) -> Self {
+    pub fn new(path: Option<&std::path::Path>, default_wallet: Option<&Wallet>) -> Self {
         BlockchainStorage {
-            default_wallet: default_wallet.or_else(Wallet::load_from_disk).unwrap_or_else(|| {
+            default_wallet: default_wallet.cloned().or_else(Wallet::load_from_disk).unwrap_or_else(|| {
                 let w = Wallet::new();
                 w.save_to_disk().unwrap();
                 w
@@ -654,15 +652,20 @@ impl BlockchainStorage {
     }
 
     pub fn receive_block(self: &mut Self, block: &Block) -> Result<(), BlockchainError> {
-        fn err(msg: &'static str) -> Result<(), BlockchainError> { Err(BlockchainError::InvalidReceivedBlock(msg)) }
+        fn err(msg: &'static str) -> Result<(), BlockchainError> {
+            Err(BlockchainError::InvalidReceivedBlock(msg, None))
+        }
 
         fn report_integrity(e: sql::Error) -> BlockchainError {
             if let sql::Error::SqliteFailure(
-                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, .. },
+                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, extended_code: ec },
                 _,
             ) = e
             {
-                BlockchainError::InvalidReceivedBlock("Block contains transactions that do not abide by all rules")
+                BlockchainError::InvalidReceivedBlock(
+                    "Block contains transactions that do not abide by all rules",
+                    Some(libsqlite3_sys::code_to_str(ec)),
+                )
             } else {
                 BlockchainError::DatabaseError(e)
             }
@@ -760,7 +763,7 @@ impl BlockchainStorage {
         t: &sql::Transaction, ts: &[&Transaction],
     ) -> Result<(), BlockchainError> {
         fn err(msg: &'static str) -> Result<(), BlockchainError> {
-            Err(BlockchainError::InvalidReceivedTentativeTxn(msg))
+            Err(BlockchainError::InvalidReceivedTentativeTxn(msg, None))
         }
 
         if !ts
@@ -808,11 +811,14 @@ impl BlockchainStorage {
     pub fn receive_tentative_transaction(self: &mut Self, ts: &[&Transaction]) -> Result<(), BlockchainError> {
         fn report_integrity(e: sql::Error) -> BlockchainError {
             if let sql::Error::SqliteFailure(
-                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, .. },
+                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, extended_code: ec },
                 _,
             ) = e
             {
-                BlockchainError::InvalidReceivedBlock("Tentative transaction(s) do not abide by all rules")
+                BlockchainError::InvalidReceivedTentativeTxn(
+                    "Tentative transaction(s) do not abide by all rules",
+                    Some(libsqlite3_sys::code_to_str(ec)),
+                )
             } else {
                 BlockchainError::DatabaseError(e)
             }
@@ -1205,5 +1211,133 @@ mod tests {
         let mut bs = BlockchainStorage::new(None, None);
         assert!(bs.get_all_tentative_transactions().unwrap().is_empty());
         assert!(bs.get_mineable_tentative_transactions(None).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn can_mine_genesis_block() {
+        let w = Wallet::new();
+        let mut bs = BlockchainStorage::new(None, Some(&w));
+        let mut block = bs.prepare_mineable_block(None).unwrap();
+        assert!(block.solve_hash_challenge(MINIMUM_DIFFICULTY_LEVEL, None));
+        bs.receive_block(&block).unwrap();
+        assert_eq!(bs.find_wallet_balance(w.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0);
+    }
+
+    #[test]
+    fn can_receive_genesis_block() {
+        let w1 = Wallet::new();
+        let mut bs1 = BlockchainStorage::new(None, Some(&w1));
+        let w2 = Wallet::new();
+        let mut bs2 = BlockchainStorage::new(None, Some(&w2));
+        {
+            let mut block = bs1.prepare_mineable_block(None).unwrap();
+            assert!(block.solve_hash_challenge(MINIMUM_DIFFICULTY_LEVEL, None));
+            bs1.receive_block(&block).unwrap();
+            bs2.receive_block(&block).unwrap();
+        }
+        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0);
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0);
+    }
+
+    #[test]
+    fn can_send_money() {
+        let w1 = Wallet::new();
+        let mut bs1 = BlockchainStorage::new(None, Some(&w1));
+        let w2 = Wallet::new();
+        let mut bs2 = BlockchainStorage::new(None, Some(&w2));
+        {
+            let mut block = bs1.prepare_mineable_block(None).unwrap();
+            assert!(block.solve_hash_challenge(MINIMUM_DIFFICULTY_LEVEL, None));
+            bs1.receive_block(&block).unwrap();
+            bs2.receive_block(&block).unwrap();
+        }
+
+        // Create the transactions
+        let tx = bs1.create_simple_transaction(None, Amount(10000), w2.public_key_hash()).unwrap();
+
+        // Now tentative transactions should be non-empty
+        assert_eq!(bs1.get_all_tentative_transactions().unwrap().len(), 1);
+
+        // Available balance has been reduced in bs1, but not bs2
+        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0 - 10000);
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0);
+
+        // bs2 can receive this transaction
+        bs2.receive_tentative_transaction(&[&tx]).unwrap();
+
+        // From bs2's perspective, w1 has no more money left because the reward has been spent, but the change is unconfirmed.
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), None).unwrap(), 0);
+
+        // Both see one tentative tx
+        assert_eq!(bs1.get_all_tentative_transactions().unwrap().len(), 1);
+        assert_eq!(bs2.get_all_tentative_transactions().unwrap().len(), 1);
+
+        // bs2 can then mine it
+        {
+            let mut block = bs2.prepare_mineable_block(None).unwrap();
+            assert!(block.solve_hash_challenge(MINIMUM_DIFFICULTY_LEVEL, None));
+            bs1.receive_block(&block).unwrap();
+            bs2.receive_block(&block).unwrap();
+        }
+
+        // Both have a consistent view of the resulting balances
+        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0 - 10000);
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0 - 10000);
+        assert_eq!(bs1.find_wallet_balance(w2.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0 + 10000);
+        assert_eq!(bs2.find_wallet_balance(w2.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0 + 10000);
+    }
+
+    #[test]
+    fn cannot_accept_orphaned_tentative_txns() {
+        let w1 = Wallet::new();
+        let mut bs1 = BlockchainStorage::new(None, Some(&w1));
+        let w2 = Wallet::new();
+        let mut bs2 = BlockchainStorage::new(None, Some(&w2));
+        {
+            let mut block = bs1.prepare_mineable_block(None).unwrap();
+            assert!(block.solve_hash_challenge(MINIMUM_DIFFICULTY_LEVEL, None));
+            bs1.receive_block(&block).unwrap();
+            bs2.receive_block(&block).unwrap();
+        }
+
+        // Create two transactions, the latter is dependent on the UTXO of the first.
+        let tx1 = bs1.create_simple_transaction(None, Amount(12345), w2.public_key_hash()).unwrap();
+        let tx2 = bs1.create_simple_transaction(None, Amount(23456), w2.public_key_hash()).unwrap();
+
+        assert_eq!(tx2.inputs.len(), 1);
+        assert_eq!(tx2.inputs[0].transaction_hash, tx1.transaction_hash());
+
+        // bs2 cannot receive just the second, now orphaned txn
+        // TODO needs fix
+        assert!(bs2.receive_tentative_transaction(&[&tx2]).is_err());
+
+        // bs2 can receive both
+        bs2.receive_tentative_transaction(&[&tx1, &tx2]).unwrap();
+    }
+
+    #[test]
+    fn can_accept_conflicting_tentative_txns() {
+        let w1 = Wallet::new();
+        let mut bs1a = BlockchainStorage::new(None, Some(&w1));
+        let mut bs1b = BlockchainStorage::new(None, Some(&w1));
+        let w2 = Wallet::new();
+        let mut bs2 = BlockchainStorage::new(None, Some(&w2));
+        let w3 = Wallet::new();
+        {
+            let mut block = bs1a.prepare_mineable_block(None).unwrap();
+            assert!(block.solve_hash_challenge(MINIMUM_DIFFICULTY_LEVEL, None));
+            bs1a.receive_block(&block).unwrap();
+            bs1b.receive_block(&block).unwrap();
+            bs2.receive_block(&block).unwrap();
+        }
+
+        // Now w1 attempts to spend the money twice, creating a conflict.
+        let tx1 = bs1a.create_simple_transaction(None, Amount(12345), w2.public_key_hash()).unwrap();
+        let tx2 = bs1b.create_simple_transaction(None, Amount(23456), w3.public_key_hash()).unwrap();
+
+        // All of them can accept the tentative transactions successfully.
+        bs1b.receive_tentative_transaction(&[&tx1]).unwrap();
+        bs1a.receive_tentative_transaction(&[&tx2]).unwrap();
+        bs2.receive_tentative_transaction(&[&tx1, &tx2]).unwrap();
     }
 }
