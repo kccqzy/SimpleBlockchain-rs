@@ -1090,6 +1090,16 @@ impl BlockchainStorage {
             Ok(Some(rv))
         })
     }
+
+    pub fn prepare_mineable_block(self: &mut Self, miner_wallet: Option<&Wallet>) -> sql::Result<Block> {
+        let miner_wallet = miner_wallet.unwrap_or(&self.default_wallet);
+        let mut block = Block::new_mine_block(miner_wallet);
+        let (mut new_tx, parent_hash) = self.get_mineable_tentative_transactions(None)?;
+        let parent_hash = parent_hash.unwrap_or_else(Hash::zeroes);
+        block.transactions.append(&mut new_tx);
+        block.parent_hash = parent_hash;
+        Ok(block)
+    }
 }
 
 #[cfg(test)]
