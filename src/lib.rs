@@ -847,24 +847,21 @@ impl BlockchainStorage {
     }
 
     pub fn find_wallet_balance(
-        self: &Self, wallet_public_key_hash: &Hash, required_confirmations: Option<u32>,
+        self: &Self, wallet_public_key_hash: &Hash, required_confirmations: u32,
     ) -> sql::Result<u64> {
+        // NOTE that it is generally incorrect to get UTXO with zero
+        // confirmations. They could very well be double-spending transactions
+        // that will never get any confirmations. Here we internally make sure
+        // that every transaction either has > 0 confirmations or is produced by
+        // a trustworthy wallet. Even when the supplied required_confirmations
+        // is 0, that invariant is still respected.
+
         // NOTE that we return a plain u64 because although an individual
         // monetary amount is not allowed to exceed MAX_MONEY, the sum may.
-        Ok((match required_confirmations {
-            None => {
-                let mut stmt = self.conn.prepare_cached("SELECT sum(amount) FROM utxo WHERE recipient_hash = ?")?;
-                stmt.query_row(&[&wallet_public_key_hash], |r| r.get::<_, Option<i64>>(0))?
-            }
-            Some(conf) => {
-                let mut stmt = self
-                    .conn
-                    .prepare_cached("SELECT sum(amount) FROM utxo WHERE recipient_hash = ? AND confirmations >= ?")?;
-                let params: [&dyn sql::ToSql; 2] = [&wallet_public_key_hash, &conf];
-                stmt.query_row(&params, |r| r.get::<_, Option<i64>>(0))?
-            }
-        })
-        .unwrap_or(0) as u64)
+        let mut stmt =
+            self.conn.prepare_cached("SELECT sum(amount) FROM utxo WHERE recipient_hash = ? AND confirmations >= ?")?;
+        let params: [&dyn sql::ToSql; 2] = [&wallet_public_key_hash, &required_confirmations];
+        stmt.query_row(&params, |r| r.get::<_, Option<i64>>(0)).map(|r| r.unwrap_or(0) as u64)
     }
 
     pub fn create_simple_transaction(
@@ -1202,7 +1199,7 @@ mod tests {
     fn initial_default_wallet_zero_balance() {
         let mut bs = BlockchainStorage::new(None, None);
         let h = Hash::sha256(&bs.default_wallet.public_serialized.0);
-        assert_eq!(bs.find_wallet_balance(&h, None).unwrap(), 0);
+        assert_eq!(bs.find_wallet_balance(&h, 0).unwrap(), 0);
         assert_eq!(BlockchainStorage::find_available_spend(&bs.conn.transaction().unwrap(), &h).unwrap().count(), 0);
     }
 
@@ -1220,7 +1217,7 @@ mod tests {
         let mut block = bs.prepare_mineable_block(None).unwrap();
         assert!(block.solve_hash_challenge(MINIMUM_DIFFICULTY_LEVEL, None));
         bs.receive_block(&block).unwrap();
-        assert_eq!(bs.find_wallet_balance(w.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0);
+        assert_eq!(bs.find_wallet_balance(w.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0);
     }
 
     #[test]
@@ -1235,8 +1232,8 @@ mod tests {
             bs1.receive_block(&block).unwrap();
             bs2.receive_block(&block).unwrap();
         }
-        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0);
-        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0);
+        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0);
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0);
     }
 
     #[test]
@@ -1259,14 +1256,14 @@ mod tests {
         assert_eq!(bs1.get_all_tentative_transactions().unwrap().len(), 1);
 
         // Available balance has been reduced in bs1, but not bs2
-        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0 - 10000);
-        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0);
+        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0 - 10000);
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0);
 
         // bs2 can receive this transaction
         bs2.receive_tentative_transaction(&[&tx]).unwrap();
 
         // From bs2's perspective, w1 has no more money left because the reward has been spent, but the change is unconfirmed.
-        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), None).unwrap(), 0);
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), 0);
 
         // Both see one tentative tx
         assert_eq!(bs1.get_all_tentative_transactions().unwrap().len(), 1);
@@ -1281,10 +1278,10 @@ mod tests {
         }
 
         // Both have a consistent view of the resulting balances
-        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0 - 10000);
-        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0 - 10000);
-        assert_eq!(bs1.find_wallet_balance(w2.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0 + 10000);
-        assert_eq!(bs2.find_wallet_balance(w2.public_key_hash(), None).unwrap(), Amount::BLOCK_REWARD.0 + 10000);
+        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0 - 10000);
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0 - 10000);
+        assert_eq!(bs1.find_wallet_balance(w2.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0 + 10000);
+        assert_eq!(bs2.find_wallet_balance(w2.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0 + 10000);
     }
 
     #[test]
