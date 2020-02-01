@@ -352,6 +352,22 @@ impl std::convert::From<sql::Error> for BlockchainError {
     fn from(error: sql::Error) -> Self { BlockchainError::DatabaseError(error) }
 }
 
+macro_rules! replace_expr {
+    ($_t:tt $sub:expr) => {
+        $sub
+    };
+}
+
+macro_rules! execute {
+    ( $t:expr, $sql:expr, $( $param:expr ),* ) => {
+        {
+            let mut stmt = $t.prepare_cached($sql)?;
+            let params: [&dyn sql::ToSql; {0usize $(+ replace_expr!($param 1usize))* }] = [ $( $param ),* ];
+            stmt.execute(&params)
+        }
+    }
+}
+
 impl BlockchainStorage {
     fn open_conn(path: Option<&std::path::Path>) -> sql::Connection {
         let conn = match path {
@@ -611,8 +627,7 @@ impl BlockchainStorage {
     }
 
     pub fn make_wallet_trustworthy(self: &Self, h: &Hash) -> sql::Result<()> {
-        let mut stmt = self.conn.prepare_cached("INSERT INTO trustworthy_wallets VALUES (?)")?;
-        stmt.execute(&[&h.0[..]])?;
+        execute!(self.conn, "INSERT INTO trustworthy_wallets VALUES (?)", h)?;
         Ok(())
     }
 
@@ -624,28 +639,34 @@ impl BlockchainStorage {
 
     fn insert_transaction_raw(t: &sql::Transaction, txn: &Transaction) -> sql::Result<()> {
         let txn_hash = txn.transaction_hash();
-        let row_count = {
-            let mut stmt = t.prepare_cached(
-                "INSERT INTO transactions (transaction_hash, payer, payer_hash, signature) VALUES (?,?,?,?)",
-            )?;
-            let params: [&dyn sql::ToSql; 4] = [&txn_hash, &txn.payer, &Hash::sha256(&txn.payer.0), &txn.signature];
-            stmt.execute(&params)?
-        };
+        let row_count = execute!(
+            t,
+            "INSERT INTO transactions (transaction_hash, payer, payer_hash, signature) VALUES (?,?,?,?)",
+            &txn_hash,
+            &txn.payer,
+            &Hash::sha256(&txn.payer.0),
+            &txn.signature
+        )?;
         if row_count > 0 {
-            {
-                let mut stmt = t.prepare_cached("INSERT INTO transaction_outputs VALUES (?,?,?,?)")?;
-                for (index, out) in txn.outputs.iter().enumerate() {
-                    let params: [&dyn sql::ToSql; 4] = [&txn_hash, &(index as i64), &out.amount, &out.recipient_hash];
-                    stmt.execute(&params)?;
-                }
+            for (index, out) in txn.outputs.iter().enumerate() {
+                execute!(
+                    t,
+                    "INSERT INTO transaction_outputs VALUES (?,?,?,?)",
+                    &txn_hash,
+                    &(index as i64),
+                    &out.amount,
+                    &out.recipient_hash
+                )?;
             }
-            {
-                let mut stmt = t.prepare_cached("INSERT INTO transaction_inputs VALUES (?,?,?,?)")?;
-                for (index, inp) in txn.inputs.iter().enumerate() {
-                    let params: [&dyn sql::ToSql; 4] =
-                        [&txn_hash, &(index as i64), &inp.transaction_hash, &inp.output_index];
-                    stmt.execute(&params)?;
-                }
+            for (index, inp) in txn.inputs.iter().enumerate() {
+                execute!(
+                    t,
+                    "INSERT INTO transaction_inputs VALUES (?,?,?,?)",
+                    &txn_hash,
+                    &(index as i64),
+                    &inp.transaction_hash,
+                    &inp.output_index
+                )?;
             }
         }
         Ok(())
@@ -716,24 +737,26 @@ impl BlockchainStorage {
 
         let t = self.conn.transaction()?;
 
-        {
-            let mut stmt = t.prepare_cached("INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (?,?,?)")?;
-            let params: [&dyn sql::ToSql; 3] = [
-                &block.block_hash,
-                if block.parent_hash != Hash::zeroes() { &block.parent_hash } else { &sql::types::Null },
-                &(block.nonce as i64),
-            ];
-            stmt.execute(&params).map_err(report_integrity)?;
-        }
+        execute!(
+            t,
+            "INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (?,?,?)",
+            &block.block_hash,
+            if block.parent_hash != Hash::zeroes() { &block.parent_hash } else { &sql::types::Null },
+            &(block.nonce as i64)
+        )
+        .map_err(report_integrity)?;
         for txn in block.transactions.iter() {
             BlockchainStorage::insert_transaction_raw(&t, &txn).map_err(report_integrity)?;
         }
-        {
-            let mut stmt = t.prepare_cached("INSERT INTO transaction_in_block VALUES (?,?,?)")?;
-            for (index, txn) in block.transactions.iter().enumerate() {
-                let params: [&dyn sql::ToSql; 3] = [&txn.transaction_hash(), &block.block_hash, &(index as i64)];
-                stmt.execute(&params).map_err(report_integrity)?;
-            }
+        for (index, txn) in block.transactions.iter().enumerate() {
+            execute!(
+                t,
+                "INSERT INTO transaction_in_block VALUES (?,?,?)",
+                &txn.transaction_hash(),
+                &block.block_hash,
+                &(index as i64)
+            )
+            .map_err(report_integrity)?;
         }
         {
             let mut stmt = t.prepare_cached("SELECT count(*) FROM unauthorized_spending JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ?")?;
@@ -1000,11 +1023,7 @@ impl BlockchainStorage {
             )?;
             stmt.query_row(sql::NO_PARAMS, |r| r.get(0)).optional()?
         };
-        {
-            let mut stmt =
-                t.prepare_cached("INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (x'deadface', ?, 0)")?;
-            stmt.execute(&[&parent_hash])?;
-        }
+        execute!(t, "INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (x'deadface', ?, 0)", &parent_hash)?;
 
         while rv.len() < limit as usize {
             let all_tentative_txns: Vec<(Hash, PayerPublicKey, Signature)> = {
@@ -1019,11 +1038,8 @@ impl BlockchainStorage {
             let mut progress = false;
             for (h, p, s) in all_tentative_txns.into_iter() {
                 let mut sp = t.savepoint()?;
-                {
-                    let mut stmt = sp.prepare_cached("INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, x'deadface', ?)")?;
-                    let params: [&dyn sql::ToSql; 2] = [&h, &(rv.len() as u16)];
-                    stmt.execute(&params)?;
-                }
+                execute!(sp, "INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, x'deadface', ?)",
+                         &h, &(rv.len() as u16))?;
                 let violations_count: i64 = {
                     let mut stmt = sp.prepare_cached(
                         "SELECT total_violations_count FROM block_consistency WHERE perspective_block = x'deadface'",
