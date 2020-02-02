@@ -498,6 +498,20 @@ impl BlockchainStorage {
                     CHECK ( length(payer_hash) = 32 )
                 );
 
+                CREATE TABLE IF NOT EXISTS orphaned_transactions (
+                    transaction_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
+                    transaction_blob BLOB NOT NULL,
+                    CHECK ( length(transaction_hash) = 32 )
+                );
+
+                CREATE TABLE IF NOT EXISTS orphaned_transactions_missing_deps (
+                    transaction_hash BLOB NOT NULL REFERENCES orphaned_transactions (transaction_hash),
+                    dependency BLOB NOT NULL,
+                    PRIMARY KEY (transaction_hash, dependency) ON CONFLICT IGNORE,
+                    CHECK ( length(dependency) = 32 )
+                );
+                CREATE INDEX IF NOT EXISTS orhpaned_deps ON orphaned_transactions_missing_deps (dependency);
+
                 CREATE VIEW IF NOT EXISTS unauthorized_spending AS
                 SELECT transactions.*, transaction_outputs.recipient_hash AS owner_hash, transaction_outputs.amount
                 FROM transactions
@@ -876,6 +890,35 @@ impl BlockchainStorage {
         let t = self.conn.transaction()?;
         BlockchainStorage::receive_tentative_transaction_internal(&t, tx)?;
         t.commit().map_err(report_integrity)?;
+        Ok(())
+    }
+
+    pub fn receive_possibly_orphaned_tentative_transaction(
+        self: &mut Self, tx: &Transaction,
+    ) -> Result<(), BlockchainError> {
+        let t = self.conn.transaction()?;
+
+        let th = tx.transaction_hash();
+        let tx_serialized = bincode::serialize(tx).unwrap();
+
+        // We assume that, the transaction is indeed orphaned. Later we will (and indeed have to) check this.
+        let row_count = execute!(t, "INSERT INTO orphaned_transactions VALUES (?,?)", &th, &tx_serialized)?;
+        if row_count > 0 {
+            for dep in tx.inputs.iter().map(|i| &i.transaction_hash) {
+                execute!(t, "INSERT INTO orphaned_transactions_missing_deps VALUES (?,?)", &th, dep)?;
+            }
+        }
+
+        // Now remove those inaccurate dependencies.
+        execute!(t, "DELETE FROM orphaned_transactions_missing_deps WHERE transaction_hash = ? AND dependency IN (SELECT transaction_hash FROM transactions)", &th)?;
+
+        // Remove the transaction itself if needed.
+        let row_count = execute!(t, "DELETE FROM orphaned_transactions WHERE transaction_hash = ? AND transaction_hash NOT IN (SELECT transaction_hash FROM orphaned_transactions_missing_deps)", &th)?;
+        if row_count > 0 {
+            // This is in fact not an orphan.
+            BlockchainStorage::receive_tentative_transaction_internal(&t, tx)?; // TODO report_integrity
+        }
+        t.commit()?;
         Ok(())
     }
 
@@ -1279,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn cannot_accept_orphaned_tentative_txns() {
+    fn can_accept_orphaned_tentative_txns() {
         let w1 = Wallet::new();
         let mut bs1 = BlockchainStorage::new(None, Some(&w1));
         let w2 = Wallet::new();
@@ -1298,13 +1341,9 @@ mod tests {
         assert_eq!(tx2.inputs.len(), 1);
         assert_eq!(tx2.inputs[0].transaction_hash, tx1.transaction_hash());
 
-        // bs2 cannot receive just the second, now orphaned txn
-        // TODO needs fix
-        assert!(bs2.receive_tentative_transaction(&tx2).is_err());
-
-        // bs2 can receive them in order
-        bs2.receive_tentative_transaction(&tx1).unwrap();
-        bs2.receive_tentative_transaction(&tx2).unwrap();
+        // bs2 can receive them out of order
+        bs2.receive_possibly_orphaned_tentative_transaction(&tx2).unwrap();
+        bs2.receive_possibly_orphaned_tentative_transaction(&tx1).unwrap();
     }
 
     #[test]
