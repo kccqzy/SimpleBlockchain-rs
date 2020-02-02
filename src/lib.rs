@@ -390,7 +390,7 @@ macro_rules! query_row {
             let params: [&dyn sql::ToSql; {0usize $(+ replace_expr!($param 1usize))* }] = [ $( $param ),* ];
             stmt.query_row(&params, |row| {
                 let mut idx: usize = 0;
-                $( let $rv = { idx += 1; row.get::<usize, $rt>(idx - 1) }?  );* ;
+                $( let $rv = { idx += 1; row.get_unwrap::<usize, $rt>(idx - 1) }  );* ;
                 Ok($re)
             })
         }
@@ -407,7 +407,7 @@ macro_rules! query_vec {
             let params: [&dyn sql::ToSql; {0usize $(+ replace_expr!($param 1usize))* }] = [ $( $param ),* ];
             let rows = stmt.query_map(&params, |row| {
                 let mut idx: usize = 0;
-                $( let $rv = { idx += 1; row.get::<usize, $rt>(idx - 1) }?  );* ;
+                $( let $rv = { idx += 1; row.get_unwrap::<usize, $rt>(idx - 1) }  );* ;
                 Ok($re)
             })?;
             rows.collect::<sql::Result<Vec<_>>>()
