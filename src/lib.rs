@@ -385,6 +385,24 @@ macro_rules! query_row {
     }
 }
 
+macro_rules! query_vec {
+    ( $t:expr, $sql:expr ; $( $rv:ident : $rt:ty ),+ ; $re:expr ) => {
+        query_vec!($t, $sql, ; $( $rv : $rt ),+ ; $re)
+    };
+    ( $t:expr, $sql:expr, $( $param:expr ),* ; $( $rv:ident : $rt:ty ),+ ; $re:expr ) => {
+        {
+            let mut stmt = $t.prepare_cached($sql)?;
+            let params: [&dyn sql::ToSql; {0usize $(+ replace_expr!($param 1usize))* }] = [ $( $param ),* ];
+            let rows = stmt.query_map(&params, |row| {
+                let mut idx: usize = 0;
+                $( let $rv = { idx += 1; row.get::<usize, $rt>(idx - 1) }?  );* ;
+                Ok($re)
+            })?;
+            rows.collect::<sql::Result<Vec<_>>>()
+        }
+    }
+}
+
 impl BlockchainStorage {
     fn open_conn(path: Option<&std::path::Path>) -> sql::Connection {
         let conn = match path {
@@ -862,17 +880,10 @@ impl BlockchainStorage {
     fn find_available_spend(
         t: &sql::Transaction, wallet_public_key_hash: &Hash,
     ) -> sql::Result<impl Iterator<Item = (TransactionInput, Amount)>> {
-        let mut stmt = t.prepare_cached(
-            "SELECT out_transaction_hash, out_transaction_index, amount FROM utxo WHERE recipient_hash = ?",
-        )?;
-        let rows = stmt.query_map(&[wallet_public_key_hash], |row| {
-            Ok((TransactionInput { transaction_hash: row.get(0)?, output_index: row.get(1)? }, row.get(2)?))
-        })?;
-        Ok(rows.collect::<sql::Result<Vec<_>>>()?.into_iter())
-        // NOTE that we have to collect it into a Vec or some other
-        // container and finish consuming the entire mapped rows; this is
-        // because if any future element is an Err, we return Err without
-        // giving any item.
+        Ok(query_vec!(t, "SELECT out_transaction_hash, out_transaction_index, amount FROM utxo WHERE recipient_hash = ?", wallet_public_key_hash;
+                      transaction_hash: Hash, output_index: u16, amt: Amount;
+                      (TransactionInput { transaction_hash, output_index }, amt) )?.into_iter()
+        )
     }
 
     pub fn find_wallet_balance(
@@ -944,26 +955,16 @@ impl BlockchainStorage {
     }
 
     pub fn get_longest_chain(self: &Self) -> sql::Result<impl Iterator<Item = (Hash, u64)>> {
-        let mut stmt = self.conn.prepare_cached("SELECT block_hash, block_height FROM longest_chain")?;
-        let rows = stmt.query_map(sql::NO_PARAMS, |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))?;
-        Ok(rows.collect::<sql::Result<Vec<_>>>()?.into_iter())
+        Ok(query_vec!(self.conn, "SELECT block_hash, block_height FROM longest_chain"; h: Hash, i: i64; (h, i as u64))?
+            .into_iter())
     }
 
     fn fill_transaction_in_out(t: &sql::Transaction, tx: Transaction) -> sql::Result<Transaction> {
         let th = tx.transaction_hash();
-        let inputs = {
-            let mut stmt = t.prepare_cached("SELECT out_transaction_hash, out_transaction_index FROM transaction_inputs WHERE in_transaction_hash = ? ORDER BY in_transaction_index")?;
-            let rows = stmt.query_map(&[&th], |row| {
-                Ok(TransactionInput { transaction_hash: row.get(0)?, output_index: row.get(1)? })
-            })?;
-            rows.collect::<sql::Result<Vec<_>>>()?
-        };
-        let outputs = {
-            let mut stmt = t.prepare_cached("SELECT amount, recipient_hash FROM transaction_outputs WHERE out_transaction_hash = ? ORDER BY out_transaction_index")?;
-            let rows = stmt
-                .query_map(&[&th], |row| Ok(TransactionOutput { amount: row.get(0)?, recipient_hash: row.get(1)? }))?;
-            rows.collect::<sql::Result<Vec<_>>>()?
-        };
+        let inputs = query_vec!(t, "SELECT out_transaction_hash, out_transaction_index FROM transaction_inputs WHERE in_transaction_hash = ? ORDER BY in_transaction_index", &th;
+                                transaction_hash: Hash, output_index: u16; TransactionInput{transaction_hash, output_index})?;
+        let outputs = query_vec!(t, "SELECT amount, recipient_hash FROM transaction_outputs WHERE out_transaction_hash = ? ORDER BY out_transaction_index", &th;
+                                 amount: Amount, recipient_hash: Hash; TransactionOutput{amount, recipient_hash})?;
         Ok(Transaction { inputs, outputs, ..tx })
     }
 
@@ -977,18 +978,16 @@ impl BlockchainStorage {
         }).optional()?
         .map_or(Ok(None), |b| {
             Ok(Some(Block {
-                transactions: {
-                    let mut stmt = t.prepare_cached("SELECT payer, signature FROM transactions JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? ORDER BY transaction_index")?;
-                    let rows = stmt.query_map(&[block_hash], |row| {
-                        BlockchainStorage::fill_transaction_in_out(&t, Transaction {
-                            payer: row.get(0)?,
-                            signature: row.get(1)?,
-                            inputs: vec![],
-                            outputs: vec![],
-                        })
-                    })?;
-                    rows.collect::<sql::Result<Vec<_>>>()?
-                },
+                transactions: query_vec!(
+                    t, "SELECT payer, signature FROM transactions JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? ORDER BY transaction_index", block_hash;
+                    payer: PayerPublicKey, signature: Signature;
+                    BlockchainStorage::fill_transaction_in_out(&t, Transaction {
+                        payer,
+                        signature,
+                        inputs: vec![],
+                        outputs: vec![],
+                    })?
+                )?,
                 ..b
             }))
         })
@@ -996,16 +995,15 @@ impl BlockchainStorage {
 
     pub fn get_all_tentative_transactions(self: &mut Self) -> sql::Result<Vec<Transaction>> {
         let t = self.conn.transaction()?;
-        let mut stmt = t.prepare_cached("SELECT payer, signature FROM all_tentative_txns")?;
-        let rows = stmt.query_map(sql::NO_PARAMS, |row| {
-            BlockchainStorage::fill_transaction_in_out(&t, Transaction {
-                payer: row.get(0)?,
-                signature: row.get(1)?,
-                inputs: vec![],
-                outputs: vec![],
-            })
-        })?;
-        rows.collect::<sql::Result<Vec<_>>>()
+        query_vec!(t, "SELECT payer, signature FROM all_tentative_txns";
+                   payer: PayerPublicKey, signature: Signature;
+                   BlockchainStorage::fill_transaction_in_out(&t, Transaction {
+                       payer,
+                       signature,
+                       inputs: vec![],
+                       outputs: vec![],
+                   })?
+        )
     }
 
     pub fn get_mineable_tentative_transactions(
@@ -1023,12 +1021,8 @@ impl BlockchainStorage {
         execute!(t, "INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (x'deadface', ?, 0)", &parent_hash)?;
 
         while rv.len() < limit as usize {
-            let all_tentative_txns: Vec<(Hash, PayerPublicKey, Signature)> = {
-                let mut stmt = t.prepare_cached("SELECT transaction_hash, payer, signature FROM all_tentative_txns ORDER BY discovered_at ASC LIMIT ?")?;
-                let rows =
-                    stmt.query_map(&[&(limit - (rv.len() as u16))], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-                rows.collect::<sql::Result<Vec<_>>>()?
-            };
+            let all_tentative_txns = query_vec!(t, "SELECT transaction_hash, payer, signature FROM all_tentative_txns ORDER BY discovered_at ASC LIMIT ?", &(limit - (rv.len() as u16));
+                                                h: Hash, p: PayerPublicKey, s: Signature; (h, p, s))?;
             if all_tentative_txns.is_empty() {
                 break; // Found all tentative txns.
             }
@@ -1037,8 +1031,7 @@ impl BlockchainStorage {
                 let mut sp = t.savepoint()?;
                 execute!(sp, "INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, x'deadface', ?)",
                          &h, &(rv.len() as u16))?;
-                if query_row!(sp, "SELECT total_violations_count FROM block_consistency WHERE perspective_block = x'deadface'"; c: i64; c > 0)?
-                {
+                if query_row!(sp, "SELECT total_violations_count FROM block_consistency WHERE perspective_block = x'deadface'"; c: i64; c > 0)? {
                     sp.rollback()?
                 } else {
                     sp.commit()?;
