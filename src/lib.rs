@@ -63,7 +63,7 @@ pub struct Wallet {
 pub struct Block {
     nonce: u64,
     transactions: Vec<Transaction>,
-    parent_hash: Hash, // TODO refactor into Option
+    parent_hash: Option<Hash>,
     block_hash: Hash,
 }
 
@@ -349,7 +349,7 @@ impl Block {
 
     fn new_mine_block(w: &Wallet) -> Self {
         Block {
-            parent_hash: Hash::zeroes(),
+            parent_hash: None,
             block_hash: Hash::zeroes(),
             nonce: 0,
             transactions: vec![w.create_raw_transaction(vec![], vec![TransactionOutput {
@@ -782,7 +782,7 @@ impl BlockchainStorage {
             t,
             "INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (?,?,?)",
             &block.block_hash,
-            if block.parent_hash != Hash::zeroes() { &block.parent_hash } else { &sql::types::Null },
+            &block.parent_hash,
             &(block.nonce as i64)
         )
         .map_err(report_integrity)?;
@@ -982,7 +982,7 @@ impl BlockchainStorage {
 
     pub fn get_block_by_hash(self: &mut Self, block_hash: &Hash) -> sql::Result<Option<Block>> {
         let t = self.conn.transaction()?;
-        query_row!(t, "SELECT nonce, parent_hash, block_hash FROM blocks WHERE block_hash = ?", &block_hash; nonce: i64, parent_hash: Hash, block_hash: Hash; Block {
+        query_row!(t, "SELECT nonce, parent_hash, block_hash FROM blocks WHERE block_hash = ?", &block_hash; nonce: i64, parent_hash: Option<Hash>, block_hash: Hash; Block {
             nonce: nonce as u64,
             transactions: vec![],
             parent_hash,
@@ -1043,7 +1043,8 @@ impl BlockchainStorage {
                 let mut sp = t.savepoint()?;
                 execute!(sp, "INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, x'deadface', ?)",
                          &h, &(rv.len() as u16))?;
-                if query_row!(sp, "SELECT total_violations_count FROM block_consistency WHERE perspective_block = x'deadface'"; c: i64; c > 0)? {
+                if query_row!(sp, "SELECT total_violations_count FROM block_consistency WHERE perspective_block = x'deadface'"; c: i64; c > 0)?
+                {
                     sp.rollback()?
                 } else {
                     sp.commit()?;
@@ -1105,7 +1106,6 @@ impl BlockchainStorage {
         let miner_wallet = miner_wallet.unwrap_or(&self.default_wallet);
         let mut block = Block::new_mine_block(miner_wallet);
         let (mut new_tx, parent_hash) = self.get_mineable_tentative_transactions(None)?;
-        let parent_hash = parent_hash.unwrap_or_else(Hash::zeroes);
         block.transactions.append(&mut new_tx);
         block.parent_hash = parent_hash;
         Ok(block)
@@ -1150,18 +1150,14 @@ mod tests {
 
     #[test]
     fn serialized_block_has_nonce_first() {
-        let b = Block {
-            nonce: 0x4142434445464748,
-            transactions: vec![],
-            parent_hash: Hash::zeroes(),
-            block_hash: Hash::zeroes(),
-        };
+        let b =
+            Block { nonce: 0x4142434445464748, transactions: vec![], parent_hash: None, block_hash: Hash::zeroes() };
         assert_eq!(&b.to_hash_challenge()[0..8], bincode::serialize(&b.nonce).unwrap().as_slice());
     }
 
     #[test]
     fn can_solve_hash_challenge() {
-        let mut b = Block { nonce: 0, transactions: vec![], parent_hash: Hash::zeroes(), block_hash: Hash::zeroes() };
+        let mut b = Block { nonce: 0, transactions: vec![], parent_hash: None, block_hash: Hash::zeroes() };
         assert!(b.solve_hash_challenge(16, None));
         eprintln!("Block with solved hash challenge: {:?}", b);
         assert_ne!(b.block_hash, Hash::zeroes());
@@ -1224,6 +1220,7 @@ mod tests {
         let mut block = bs.prepare_mineable_block(None).unwrap();
         assert!(block.solve_hash_challenge(MINIMUM_DIFFICULTY_LEVEL, None));
         bs.receive_block(&block).unwrap();
+        assert_eq!(bs.get_block_by_hash(&block.block_hash).unwrap(), Some(block));
         assert_eq!(bs.find_wallet_balance(w.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0);
     }
 
