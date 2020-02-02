@@ -821,53 +821,43 @@ impl BlockchainStorage {
         Ok(())
     }
 
-    fn receive_tentative_transaction_internal(
-        t: &sql::Transaction, ts: &[&Transaction],
-    ) -> Result<(), BlockchainError> {
+    fn receive_tentative_transaction_internal(t: &sql::Transaction, tx: &Transaction) -> Result<(), BlockchainError> {
         fn err(msg: &'static str) -> Result<(), BlockchainError> {
             Err(BlockchainError::InvalidReceivedTentativeTxn(msg, None))
         }
 
-        if !ts
-            .iter()
-            .all(|t| 1 <= t.outputs.len() && t.outputs.len() <= 256 && 1 <= t.inputs.len() && t.inputs.len() <= 256)
+        if !(1 <= tx.outputs.len() && tx.outputs.len() <= 256 && 1 <= tx.inputs.len() && tx.inputs.len() <= 256) {
+            err("The tentative transaction must have at least one input and one output, and at most 256")?;
+        }
+
+        if !(tx.outputs.iter().all(|o| o.amount <= Amount::MAX_MONEY)) {
+            err("Every output of the tentative transaction must have a value of no more than 100 billion")?;
+        }
+
+        if tx.outputs.len()
+            != tx.outputs.iter().map(|o| &o.recipient_hash).collect::<std::collections::HashSet<_>>().len()
         {
-            err("Tentative transaction(s) must each have at least one input and one output, and at most 256")?;
+            err("The tentative transaction must have distinct output recipients")?;
         }
 
-        if !ts.iter().all(|t| t.outputs.iter().all(|o| o.amount <= Amount::MAX_MONEY)) {
-            err("Every output of every tentative transaction must have a value of no more than 100 billion")?;
+        if !tx.verify_signature() {
+            err("The tentative transaction must be correctly signed")?;
         }
 
-        if !ts.iter().all(|t| {
-            t.outputs.len()
-                == t.outputs.iter().map(|o| &o.recipient_hash).collect::<std::collections::HashSet<_>>().len()
-        }) {
-            err("Tentative transaction(s) must each have distinct output recipients")?;
+        BlockchainStorage::insert_transaction_raw(t, tx)?;
+        let th = tx.transaction_hash();
+        if query_row!(t, "SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?", &th; r: i64; r > 0)? {
+            err("The tentative transaction contain unauthorized spending")?;
+        }
+        if query_row!(t, "SELECT count(*) FROM transaction_credit_debit WHERE transaction_hash = ? AND debited_amount > credited_amount", &th; r: i64; r > 0)?
+        {
+            err("The tentative transaction has an input that spends more than the amount in the referenced output")?;
         }
 
-        if !ts.iter().all(|t| t.verify_signature()) {
-            err("Tentative transaction(s) must be correctly signed")?;
-        }
-
-        for tx in ts {
-            BlockchainStorage::insert_transaction_raw(t, tx)?;
-            let th = tx.transaction_hash();
-            if query_row!(t, "SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?", &th; r: i64; r > 0)?
-            {
-                err("Tentative transaction(s) contain unauthorized spending")?;
-            }
-            if query_row!(t, "SELECT count(*) FROM transaction_credit_debit WHERE transaction_hash = ? AND debited_amount > credited_amount", &th; r: i64; r > 0)?
-            {
-                err(
-                    "Tentative transaction(s) have an input that spends more than the amount in the referenced output",
-                )?;
-            }
-        }
         Ok(())
     }
 
-    pub fn receive_tentative_transaction(self: &mut Self, ts: &[&Transaction]) -> Result<(), BlockchainError> {
+    pub fn receive_tentative_transaction(self: &mut Self, tx: &Transaction) -> Result<(), BlockchainError> {
         fn report_integrity(e: sql::Error) -> BlockchainError {
             if let sql::Error::SqliteFailure(
                 libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, extended_code: ec },
@@ -884,7 +874,7 @@ impl BlockchainStorage {
         }
 
         let t = self.conn.transaction()?;
-        BlockchainStorage::receive_tentative_transaction_internal(&t, ts)?;
+        BlockchainStorage::receive_tentative_transaction_internal(&t, tx)?;
         t.commit().map_err(report_integrity)?;
         Ok(())
     }
@@ -959,7 +949,7 @@ impl BlockchainStorage {
                     vec![TransactionOutput { amount: total_amount, recipient_hash: recipient_hash.clone() }]
                 };
                 let txn = wallet.create_raw_transaction(inputs, outputs);
-                BlockchainStorage::receive_tentative_transaction_internal(&t, &[&txn])?;
+                BlockchainStorage::receive_tentative_transaction_internal(&t, &txn)?;
                 t.commit()?;
                 Ok(txn)
             }
@@ -1264,7 +1254,7 @@ mod tests {
         assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0);
 
         // bs2 can receive this transaction
-        bs2.receive_tentative_transaction(&[&tx]).unwrap();
+        bs2.receive_tentative_transaction(&tx).unwrap();
 
         // From bs2's perspective, w1 has no more money left because the reward has been spent, but the change is unconfirmed.
         assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), 0);
@@ -1310,10 +1300,11 @@ mod tests {
 
         // bs2 cannot receive just the second, now orphaned txn
         // TODO needs fix
-        assert!(bs2.receive_tentative_transaction(&[&tx2]).is_err());
+        assert!(bs2.receive_tentative_transaction(&tx2).is_err());
 
-        // bs2 can receive both
-        bs2.receive_tentative_transaction(&[&tx1, &tx2]).unwrap();
+        // bs2 can receive them in order
+        bs2.receive_tentative_transaction(&tx1).unwrap();
+        bs2.receive_tentative_transaction(&tx2).unwrap();
     }
 
     #[test]
@@ -1337,8 +1328,9 @@ mod tests {
         let tx2 = bs1b.create_simple_transaction(None, Amount(23456), w3.public_key_hash()).unwrap();
 
         // All of them can accept the tentative transactions successfully.
-        bs1b.receive_tentative_transaction(&[&tx1]).unwrap();
-        bs1a.receive_tentative_transaction(&[&tx2]).unwrap();
-        bs2.receive_tentative_transaction(&[&tx1, &tx2]).unwrap();
+        bs1b.receive_tentative_transaction(&tx1).unwrap();
+        bs1a.receive_tentative_transaction(&tx2).unwrap();
+        bs2.receive_tentative_transaction(&tx1).unwrap();
+        bs2.receive_tentative_transaction(&tx2).unwrap();
     }
 }
