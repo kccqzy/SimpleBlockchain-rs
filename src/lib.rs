@@ -368,6 +368,23 @@ macro_rules! execute {
     }
 }
 
+macro_rules! query_row {
+    ( $t:expr, $sql:expr ; $( $rv:ident : $rt:ty ),+ ; $re:expr ) => {
+        query_row!($t, $sql, ; $( $rv : $rt ),+ ; $re)
+    };
+    ( $t:expr, $sql:expr, $( $param:expr ),* ; $( $rv:ident : $rt:ty ),+ ; $re:expr ) => {
+        {
+            let mut stmt = $t.prepare_cached($sql)?;
+            let params: [&dyn sql::ToSql; {0usize $(+ replace_expr!($param 1usize))* }] = [ $( $param ),* ];
+            stmt.query_row(&params, |row| {
+                let mut idx: usize = 0;
+                $( let $rv = { idx += 1; row.get::<usize, $rt>(idx - 1) }?  );* ;
+                Ok($re)
+            })
+        }
+    }
+}
+
 impl BlockchainStorage {
     fn open_conn(path: Option<&std::path::Path>) -> sql::Connection {
         let conn = match path {
@@ -615,14 +632,8 @@ impl BlockchainStorage {
         // are consistent. TODO Maybe refactor.
         let t = self.conn.transaction()?;
         Ok(BlockchainStats {
-            block_count: {
-                let mut stmt = t.prepare_cached("SELECT 1 + ifnull((SELECT max(block_height) FROM blocks), -1)")?;
-                stmt.query_row(sql::NO_PARAMS, |r| r.get::<_, i64>(0))? as u64
-            },
-            pending_txn_count: {
-                let mut stmt = t.prepare_cached("SELECT count(*) FROM all_tentative_txns")?;
-                stmt.query_row(sql::NO_PARAMS, |r| r.get::<_, i64>(0))? as u64
-            },
+            block_count: query_row!(t, "SELECT 1 + ifnull((SELECT max(block_height) FROM blocks), -1)"; c: i64; c as u64)?,
+            pending_txn_count: query_row!(t, "SELECT count(*) FROM all_tentative_txns"; c: i64; c as u64)?,
         })
     }
 
@@ -758,24 +769,22 @@ impl BlockchainStorage {
             )
             .map_err(report_integrity)?;
         }
+        if query_row!(t, "SELECT count(*) FROM unauthorized_spending JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ?",
+                      &block.block_hash; r: i64; r > 0)?
         {
-            let mut stmt = t.prepare_cached("SELECT count(*) FROM unauthorized_spending JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ?")?;
-            if stmt.query_row(&[&block.block_hash], |r| r.get::<_, i64>(0))? > 0 {
-                err("Transaction(s) in block contain unauthorized spending")?;
-            }
+            err("Transaction(s) in block contain unauthorized spending")?;
         }
+        if query_row!(t,
+                      "SELECT count(*) FROM transaction_credit_debit JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? AND debited_amount > credited_amount",
+                      &block.block_hash; r: i64; r > 0)?
         {
-            let mut stmt = t.prepare_cached("SELECT count(*) FROM transaction_credit_debit JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? AND debited_amount > credited_amount")?;
-            if stmt.query_row(&[&block.block_hash], |r| r.get::<_, i64>(0))? > 0 {
-                err("Transaction(s) in block have an input that spends more than the amount in the referenced output")?;
-            }
+            err("Transaction(s) in block have an input that spends more than the amount in the referenced output")?;
         }
+        if query_row!(t,
+                      "SELECT total_violations_count FROM block_consistency WHERE perspective_block = ?",
+                      &block.block_hash; r: i64; r > 0)?
         {
-            let mut stmt =
-                t.prepare_cached("SELECT total_violations_count FROM block_consistency WHERE perspective_block = ?")?;
-            if stmt.query_row(&[&block.block_hash], |r| r.get::<_, i64>(0))? > 0 {
-                err("Transaction(s) in block are not consistent with ancestor blocks; one or more transactions either refer to a nonexistent parent or double spend a previously spent parent")?;
-            }
+            err("Transaction(s) in block are not consistent with ancestor blocks; one or more transactions either refer to a nonexistent parent or double spend a previously spent parent")?;
         }
 
         t.commit().map_err(report_integrity)?;
@@ -814,18 +823,15 @@ impl BlockchainStorage {
         for tx in ts {
             BlockchainStorage::insert_transaction_raw(t, tx)?;
             let th = tx.transaction_hash();
+            if query_row!(t, "SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?", &th; r: i64; r > 0)?
             {
-                let mut stmt =
-                    t.prepare_cached("SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?")?;
-                if stmt.query_row(&[&th], |r| r.get::<_, i64>(0))? > 0 {
-                    err("Tentative transaction(s) contain unauthorized spending")?;
-                }
+                err("Tentative transaction(s) contain unauthorized spending")?;
             }
+            if query_row!(t, "SELECT count(*) FROM transaction_credit_debit WHERE transaction_hash = ? AND debited_amount > credited_amount", &th; r: i64; r > 0)?
             {
-                let mut stmt = t.prepare_cached("SELECT count(*) FROM transaction_credit_debit WHERE transaction_hash = ? AND debited_amount > credited_amount")?;
-                if stmt.query_row(&[&th], |r| r.get::<_, i64>(0))? > 0 {
-                    err("Tentative transaction(s) have an input that spends more than the amount in the referenced output")?;
-                }
+                err(
+                    "Tentative transaction(s) have an input that spends more than the amount in the referenced output",
+                )?;
             }
         }
         Ok(())
@@ -881,10 +887,13 @@ impl BlockchainStorage {
 
         // NOTE that we return a plain u64 because although an individual
         // monetary amount is not allowed to exceed MAX_MONEY, the sum may.
-        let mut stmt =
-            self.conn.prepare_cached("SELECT sum(amount) FROM utxo WHERE recipient_hash = ? AND confirmations >= ?")?;
-        let params: [&dyn sql::ToSql; 2] = [&wallet_public_key_hash, &required_confirmations];
-        stmt.query_row(&params, |r| r.get::<_, Option<i64>>(0)).map(|r| r.unwrap_or(0) as u64)
+        query_row!(
+            self.conn,
+            "SELECT sum(amount) FROM utxo WHERE recipient_hash = ? AND confirmations >= ?",
+            &wallet_public_key_hash, &required_confirmations;
+            s: Option<i64>;
+            s.unwrap_or(0) as u64
+        )
     }
 
     pub fn create_simple_transaction(
@@ -960,19 +969,12 @@ impl BlockchainStorage {
 
     pub fn get_block_by_hash(self: &mut Self, block_hash: &Hash) -> sql::Result<Option<Block>> {
         let t = self.conn.transaction()?;
-        {
-            let mut stmt =
-                t.prepare_cached("SELECT nonce, parent_hash, block_hash FROM blocks WHERE block_hash = ?")?;
-            stmt.query_row(&[&block_hash], |row| {
-                Ok(Block {
-                    nonce: row.get::<_, i64>(0)? as u64,
-                    transactions: vec![],
-                    parent_hash: row.get(1)?,
-                    block_hash: row.get(2)?,
-                })
-            })
-            .optional()
-        }?
+        query_row!(t, "SELECT nonce, parent_hash, block_hash FROM blocks WHERE block_hash = ?", &block_hash; nonce: i64, parent_hash: Hash, block_hash: Hash; Block {
+            nonce: nonce as u64,
+            transactions: vec![],
+            parent_hash,
+            block_hash,
+        }).optional()?
         .map_or(Ok(None), |b| {
             Ok(Some(Block {
                 transactions: {
@@ -1017,12 +1019,7 @@ impl BlockchainStorage {
         let limit = limit.unwrap_or(100);
 
         // Find a parent hash.
-        let parent_hash = {
-            let mut stmt = t.prepare_cached(
-                "SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1",
-            )?;
-            stmt.query_row(sql::NO_PARAMS, |r| r.get(0)).optional()?
-        };
+        let parent_hash = query_row!(t, "SELECT block_hash FROM blocks ORDER BY block_height DESC, discovered_at ASC LIMIT 1"; h: Hash; h).optional()?;
         execute!(t, "INSERT INTO blocks (block_hash, parent_hash, nonce) VALUES (x'deadface', ?, 0)", &parent_hash)?;
 
         while rv.len() < limit as usize {
@@ -1040,13 +1037,8 @@ impl BlockchainStorage {
                 let mut sp = t.savepoint()?;
                 execute!(sp, "INSERT INTO transaction_in_block (transaction_hash, block_hash, transaction_index) VALUES (?, x'deadface', ?)",
                          &h, &(rv.len() as u16))?;
-                let violations_count: i64 = {
-                    let mut stmt = sp.prepare_cached(
-                        "SELECT total_violations_count FROM block_consistency WHERE perspective_block = x'deadface'",
-                    )?;
-                    stmt.query_row(sql::NO_PARAMS, |r| r.get(0))?
-                };
-                if violations_count > 0 {
+                if query_row!(sp, "SELECT total_violations_count FROM block_consistency WHERE perspective_block = x'deadface'"; c: i64; c > 0)?
+                {
                     sp.rollback()?
                 } else {
                     sp.commit()?;
@@ -1070,17 +1062,16 @@ impl BlockchainStorage {
 
     pub fn get_ui_transaction_by_hash(self: &mut Self, h: &Hash) -> sql::Result<Option<Vec<(String, String)>>> {
         let t = self.conn.transaction()?; // TODO this ideally would not use a transaction, but a single statement.
-        {
-            let mut stmt = t.prepare_cached("SELECT payer, signature FROM transactions WHERE transaction_hash = ?")?;
-            stmt.query_row(&[h], |row| {
-                BlockchainStorage::fill_transaction_in_out(&t, Transaction {
-                    payer: row.get(0)?,
-                    signature: row.get(1)?,
-                    inputs: vec![],
-                    outputs: vec![],
-                })
-            }).optional()?
-        }.map_or(Ok(None), |tx| {
+        query_row!(t, "SELECT payer, signature FROM transactions WHERE transaction_hash = ?", h;
+                   payer: PayerPublicKey, signature: Signature;
+                   BlockchainStorage::fill_transaction_in_out(&t, Transaction {
+                       payer,
+                       signature,
+                       inputs: vec![],
+                       outputs: vec![],
+                   })?
+        ).optional()?
+        .map_or(Ok(None), |tx| {
             let mut rv = Vec::new();
                 rv.push(("Transaction Hash".to_owned(), h.display_hex()));
             rv.push(("Originating Wallet".to_owned(), Hash::sha256(&tx.payer.0).display_base58()));
@@ -1094,17 +1085,12 @@ impl BlockchainStorage {
             for (i, tx_input) in tx.inputs.into_iter().enumerate() {
                 rv.push((format!("Input {}", i), format!("{}.{}", tx_input.transaction_hash.display_hex(), tx_input.output_index)));
             }
-            {
-                let mut stmt = t.prepare_cached("SELECT credited_amount, debited_amount FROM transaction_credit_debit WHERE transaction_hash = ?")?;
-                if let Some((cr, db)) = stmt.query_row(&[h], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).optional()? {
-                    rv.push(("Credit Amount".to_owned(), cr.to_string()));
-                    rv.push(("Debit Amount".to_owned(), db.to_string()));
-                }
+            if let Some((cr, db)) = query_row!(t, "SELECT credited_amount, debited_amount FROM transaction_credit_debit WHERE transaction_hash = ?", h; cr: i64, db: i64; (cr, db)).optional()? {
+                rv.push(("Credit Amount".to_owned(), cr.to_string()));
+                rv.push(("Debit Amount".to_owned(), db.to_string()));
             }
-            let conf = {
-                let mut stmt = t.prepare_cached("SELECT ifnull((SELECT longest_chain.confirmations FROM transaction_in_block JOIN longest_chain USING (block_hash) WHERE transaction_hash = ?), 0)")?;
-                stmt.query_row(&[h], |r| r.get::<_, i64>(0))?
-            };
+            let conf =
+                query_row!(t, "SELECT ifnull((SELECT longest_chain.confirmations FROM transaction_in_block JOIN longest_chain USING (block_hash) WHERE transaction_hash = ?), 0)", h; c: i64; c)?;
             rv.push(("Confirmations".to_owned(), conf.to_string()));
             Ok(Some(rv))
         })
