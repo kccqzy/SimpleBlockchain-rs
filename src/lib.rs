@@ -371,6 +371,9 @@ macro_rules! replace_expr {
 }
 
 macro_rules! execute {
+    ( $t:expr, $sql:expr ) => {
+        execute!($t, $sql, )
+    };
     ( $t:expr, $sql:expr, $( $param:expr ),* ) => {
         {
             let mut stmt = $t.prepare_cached($sql)?;
@@ -692,7 +695,9 @@ impl BlockchainStorage {
         Ok(w)
     }
 
-    fn insert_transaction_raw(t: &sql::Transaction, txn: &Transaction) -> sql::Result<()> {
+    fn insert_transaction_raw(
+        t: &impl std::ops::Deref<Target = sql::Connection>, txn: &Transaction,
+    ) -> sql::Result<()> {
         let txn_hash = txn.transaction_hash();
         let row_count = execute!(
             t,
@@ -835,7 +840,9 @@ impl BlockchainStorage {
         Ok(())
     }
 
-    fn receive_tentative_transaction_internal(t: &sql::Transaction, tx: &Transaction) -> Result<(), BlockchainError> {
+    fn receive_tentative_transaction_internal(
+        t: &impl std::ops::Deref<Target = sql::Connection>, tx: &Transaction,
+    ) -> Result<(), BlockchainError> {
         fn err(msg: &'static str) -> Result<(), BlockchainError> {
             Err(BlockchainError::InvalidReceivedTentativeTxn(msg, None))
         }
@@ -916,6 +923,47 @@ impl BlockchainStorage {
             t.commit()?;
         }
         Ok(())
+    }
+
+    fn collect_orphaned_transactions(self: &mut Self) -> sql::Result<std::collections::HashMap<Hash, BlockchainError>> {
+        let mut rejected_orphans = std::collections::HashMap::new();
+        let mut t = self.conn.transaction()?;
+        loop {
+            let mut progress = false;
+            // Remove all inaccurate dependencies.
+            if execute!(t, "DELETE FROM orphaned_transactions_missing_deps WHERE dependency IN (SELECT transaction_hash FROM transactions)")? == 0 {
+                break;
+            }
+
+            // Find newly de-orphaned transactions
+            let adopted = query_vec!(t,
+                           "SELECT transaction_hash, transaction_blob FROM orphaned_transactions WHERE transaction_hash NOT IN (SELECT transaction_hash FROM orphaned_transactions_missing_deps)";
+                           th: Hash, ts: Vec<u8>;
+                           (th, bincode::deserialize(&ts[..]).unwrap()))?;
+            for (th, tx) in adopted.into_iter() {
+                execute!(t, "DELETE FROM orphaned_transactions WHERE transaction_hash = ?", &th)?;
+                let mut sp = t.savepoint()?;
+                match BlockchainStorage::receive_tentative_transaction_internal(&sp, &tx) {
+                    Ok(()) => {
+                        sp.commit()?;
+                        progress = true;
+                    }
+                    Err(e @ BlockchainError::InvalidReceivedTentativeTxn(_, _)) => {
+                        sp.rollback()?;
+                        rejected_orphans.insert(th, e);
+                    }
+                    Err(BlockchainError::DatabaseError(e)) => {
+                        return Err(e);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        t.commit()?;
+        Ok(rejected_orphans)
     }
 
     fn find_available_spend(
@@ -1340,6 +1388,14 @@ mod tests {
         // bs2 can receive them out of order
         bs2.receive_tentative_transaction(&tx2).unwrap();
         bs2.receive_tentative_transaction(&tx1).unwrap();
+        bs2.collect_orphaned_transactions().unwrap();
+
+        // Both have a consistent view, if bs2 trusts unconfirmed transactions from bs1
+        bs2.make_wallet_trustworthy(&w1.public_hash).unwrap();
+        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0 - 12345 - 23456);
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0 - 12345 - 23456);
+        assert_eq!(bs1.find_wallet_balance(w2.public_key_hash(), 0).unwrap(), 12345 + 23456);
+        assert_eq!(bs2.find_wallet_balance(w2.public_key_hash(), 0).unwrap(), 12345 + 23456);
     }
 
     #[test]
