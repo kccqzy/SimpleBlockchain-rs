@@ -85,6 +85,7 @@ pub enum BlockchainError {
     DatabaseError(sql::Error),
     InvalidReceivedBlock(&'static str, Option<&'static str>),
     InvalidReceivedTentativeTxn(&'static str, Option<&'static str>),
+    InvalidOrphanedTentativeTxn(std::collections::HashMap<Hash, (&'static str, Option<&'static str>)>),
     InsufficientBalance { requested_amount: Amount, available_amount: Amount },
     MonetaryAmountTooLarge(),
 }
@@ -883,10 +884,10 @@ impl BlockchainStorage {
             err("The tentative transaction must be correctly signed")?;
         }
 
-        let t = self.conn.transaction()?;
-
         let th = tx.transaction_hash();
         let tx_serialized = bincode::serialize(tx).unwrap();
+
+        let mut t = self.conn.transaction()?;
 
         // We assume pessimistically that the transaction is orphaned. Later we will (and indeed have to) check this.
         let row_count = execute!(t, "INSERT INTO orphaned_transactions VALUES (?,?)", &th, &tx_serialized)?;
@@ -896,38 +897,13 @@ impl BlockchainStorage {
             }
         }
 
-        // Now remove those inaccurate dependencies.
-        execute!(t, "DELETE FROM orphaned_transactions_missing_deps WHERE transaction_hash = ? AND dependency IN (SELECT transaction_hash FROM transactions)", &th)?;
-
-        // Remove the transaction itself if needed.
-        let row_count = execute!(t, "DELETE FROM orphaned_transactions WHERE transaction_hash = ? AND transaction_hash NOT IN (SELECT transaction_hash FROM orphaned_transactions_missing_deps)", &th)?;
-        if row_count > 0 {
-            // This is in fact not an orphan.
-            fn report_integrity(e: sql::Error) -> BlockchainError {
-                if let sql::Error::SqliteFailure(
-                    libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, extended_code: ec },
-                    _,
-                ) = e
-                {
-                    BlockchainError::InvalidReceivedTentativeTxn(
-                        "Tentative transaction(s) do not abide by all rules",
-                        Some(libsqlite3_sys::code_to_str(ec)),
-                    )
-                } else {
-                    BlockchainError::DatabaseError(e)
-                }
-            }
-            BlockchainStorage::receive_tentative_transaction_internal(&t, tx)?;
-            t.commit().map_err(report_integrity)?;
-        } else {
-            t.commit()?;
-        }
+        BlockchainStorage::collect_orphaned_transactions(&mut t)?;
+        t.commit()?;
         Ok(())
     }
 
-    fn collect_orphaned_transactions(self: &mut Self) -> sql::Result<std::collections::HashMap<Hash, BlockchainError>> {
+    fn collect_orphaned_transactions(t: &mut sql::Transaction) -> Result<(), BlockchainError> {
         let mut rejected_orphans = std::collections::HashMap::new();
-        let mut t = self.conn.transaction()?;
         loop {
             let mut progress = false;
             // Remove all inaccurate dependencies.
@@ -948,12 +924,12 @@ impl BlockchainStorage {
                         sp.commit()?;
                         progress = true;
                     }
-                    Err(e @ BlockchainError::InvalidReceivedTentativeTxn(_, _)) => {
+                    Err(BlockchainError::InvalidReceivedTentativeTxn(a, b)) => {
                         sp.rollback()?;
-                        rejected_orphans.insert(th, e);
+                        rejected_orphans.insert(th, (a, b));
                     }
-                    Err(BlockchainError::DatabaseError(e)) => {
-                        return Err(e);
+                    e @ Err(BlockchainError::DatabaseError(_)) => {
+                        return e;
                     }
                     _ => unreachable!(),
                 }
@@ -962,8 +938,11 @@ impl BlockchainStorage {
                 break;
             }
         }
-        t.commit()?;
-        Ok(rejected_orphans)
+        if rejected_orphans.is_empty() {
+            Ok(())
+        } else {
+            Err(BlockchainError::InvalidOrphanedTentativeTxn(rejected_orphans))
+        }
     }
 
     fn find_available_spend(
@@ -1388,7 +1367,6 @@ mod tests {
         // bs2 can receive them out of order
         bs2.receive_tentative_transaction(&tx2).unwrap();
         bs2.receive_tentative_transaction(&tx1).unwrap();
-        bs2.collect_orphaned_transactions().unwrap();
 
         // Both have a consistent view, if bs2 trusts unconfirmed transactions from bs1
         bs2.make_wallet_trustworthy(&w1.public_hash).unwrap();
