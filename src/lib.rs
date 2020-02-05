@@ -1340,5 +1340,19 @@ mod tests {
         bs1b.receive_tentative_transaction(&[&tx1]).unwrap();
         bs1a.receive_tentative_transaction(&[&tx2]).unwrap();
         bs2.receive_tentative_transaction(&[&tx1, &tx2]).unwrap();
+
+        // They have different views of w1's balance, none of which are totally
+        // correct: bs1a and bs1b trust their own wallets, so they counted both
+        // transactions as correct, whereas bs2 does not trust it, and so it
+        // counted neither, and without the change UTXO.
+        assert_eq!(
+            bs1a.find_wallet_balance(w1.public_key_hash(), 0).unwrap(),
+            Amount::BLOCK_REWARD.0 * 2 - 12345 - 23456
+        );
+        assert_eq!(
+            bs1b.find_wallet_balance(w1.public_key_hash(), 0).unwrap(),
+            Amount::BLOCK_REWARD.0 * 2 - 12345 - 23456
+        );
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), 0);
     }
 }
