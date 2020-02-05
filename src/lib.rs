@@ -492,7 +492,7 @@ impl BlockchainStorage {
                     out_transaction_hash BLOB NOT NULL,
                     out_transaction_index INTEGER NOT NULL,
                     PRIMARY KEY (in_transaction_hash, in_transaction_index) ON CONFLICT IGNORE,
-                    FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs DEFERRABLE INITIALLY DEFERRED,
+                    FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs,
                     CHECK ( in_transaction_index BETWEEN 0 AND 255 )
                 );
                 CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index);
