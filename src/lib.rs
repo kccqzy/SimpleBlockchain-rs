@@ -82,9 +82,11 @@ pub struct BlockchainStats {
 
 #[derive(Debug, PartialEq)]
 pub enum BlockchainError {
+    // TODO make this an open union for clarity
     DatabaseError(sql::Error),
-    InvalidReceivedBlock(&'static str, Option<&'static str>),
-    InvalidReceivedTentativeTxn(&'static str, Option<&'static str>),
+    InvalidTxn(&'static str),
+    InvalidReceivedBlock(&'static str),
+    InvalidTentativeTxn(std::collections::HashMap<Hash, &'static str>),
     InsufficientBalance { requested_amount: Amount, available_amount: Amount },
     MonetaryAmountTooLarge(),
 }
@@ -371,6 +373,9 @@ macro_rules! replace_expr {
 }
 
 macro_rules! execute {
+    ( $t:expr, $sql:expr ) => {
+        execute!($t, $sql, )
+    };
     ( $t:expr, $sql:expr, $( $param:expr ),* ) => {
         {
             let mut stmt = $t.prepare_cached($sql)?;
@@ -488,7 +493,7 @@ impl BlockchainStorage {
                     out_transaction_hash BLOB NOT NULL,
                     out_transaction_index INTEGER NOT NULL,
                     PRIMARY KEY (in_transaction_hash, in_transaction_index) ON CONFLICT IGNORE,
-                    FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs DEFERRABLE INITIALLY DEFERRED,
+                    FOREIGN KEY(out_transaction_hash, out_transaction_index) REFERENCES transaction_outputs,
                     CHECK ( in_transaction_index BETWEEN 0 AND 255 )
                 );
                 CREATE INDEX IF NOT EXISTS input_referred ON transaction_inputs (out_transaction_hash, out_transaction_index);
@@ -497,6 +502,20 @@ impl BlockchainStorage {
                     payer_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
                     CHECK ( length(payer_hash) = 32 )
                 );
+
+                CREATE TABLE IF NOT EXISTS orphaned_transactions (
+                    transaction_hash BLOB NOT NULL PRIMARY KEY ON CONFLICT IGNORE,
+                    transaction_blob BLOB NOT NULL,
+                    CHECK ( length(transaction_hash) = 32 )
+                );
+
+                CREATE TABLE IF NOT EXISTS orphaned_transactions_missing_deps (
+                    transaction_hash BLOB NOT NULL REFERENCES orphaned_transactions (transaction_hash),
+                    dependency BLOB NOT NULL,
+                    PRIMARY KEY (transaction_hash, dependency) ON CONFLICT IGNORE,
+                    CHECK ( length(dependency) = 32 )
+                );
+                CREATE INDEX IF NOT EXISTS orhpaned_deps ON orphaned_transactions_missing_deps (dependency);
 
                 CREATE VIEW IF NOT EXISTS unauthorized_spending AS
                 SELECT transactions.*, transaction_outputs.recipient_hash AS owner_hash, transaction_outputs.amount
@@ -678,7 +697,21 @@ impl BlockchainStorage {
         Ok(w)
     }
 
-    fn insert_transaction_raw(t: &sql::Transaction, txn: &Transaction) -> sql::Result<()> {
+    fn insert_transaction_raw(
+        t: &impl std::ops::Deref<Target = sql::Connection>, txn: &Transaction,
+    ) -> Result<(), BlockchainError> {
+        fn report_integrity(e: sql::Error) -> BlockchainError {
+            if let sql::Error::SqliteFailure(
+                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, extended_code: ec },
+                _,
+            ) = e
+            {
+                BlockchainError::InvalidTxn(libsqlite3_sys::code_to_str(ec))
+            } else {
+                BlockchainError::DatabaseError(e)
+            }
+        }
+
         let txn_hash = txn.transaction_hash();
         let row_count = execute!(
             t,
@@ -687,7 +720,8 @@ impl BlockchainStorage {
             &txn.payer,
             &Hash::sha256(&txn.payer.0),
             &txn.signature
-        )?;
+        )
+        .map_err(report_integrity)?;
         if row_count > 0 {
             for (index, out) in txn.outputs.iter().enumerate() {
                 execute!(
@@ -697,7 +731,8 @@ impl BlockchainStorage {
                     &(index as i64),
                     &out.amount,
                     &out.recipient_hash
-                )?;
+                )
+                .map_err(report_integrity)?;
             }
             for (index, inp) in txn.inputs.iter().enumerate() {
                 execute!(
@@ -707,31 +742,15 @@ impl BlockchainStorage {
                     &(index as i64),
                     &inp.transaction_hash,
                     &inp.output_index
-                )?;
+                )
+                .map_err(report_integrity)?;
             }
         }
         Ok(())
     }
 
     pub fn receive_block(self: &mut Self, block: &Block) -> Result<(), BlockchainError> {
-        fn err(msg: &'static str) -> Result<(), BlockchainError> {
-            Err(BlockchainError::InvalidReceivedBlock(msg, None))
-        }
-
-        fn report_integrity(e: sql::Error) -> BlockchainError {
-            if let sql::Error::SqliteFailure(
-                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, extended_code: ec },
-                _,
-            ) = e
-            {
-                BlockchainError::InvalidReceivedBlock(
-                    "Block contains transactions that do not abide by all rules",
-                    Some(libsqlite3_sys::code_to_str(ec)),
-                )
-            } else {
-                BlockchainError::DatabaseError(e)
-            }
-        }
+        fn err(msg: &'static str) -> Result<(), BlockchainError> { Err(BlockchainError::InvalidReceivedBlock(msg)) }
 
         if block.transactions.len() > 2000 {
             err("A block may have at most 2000 transactions")?;
@@ -784,10 +803,9 @@ impl BlockchainStorage {
             &block.block_hash,
             &block.parent_hash,
             &(block.nonce as i64)
-        )
-        .map_err(report_integrity)?;
+        )?;
         for txn in block.transactions.iter() {
-            BlockchainStorage::insert_transaction_raw(&t, &txn).map_err(report_integrity)?;
+            BlockchainStorage::insert_transaction_raw(&t, &txn)?;
         }
         for (index, txn) in block.transactions.iter().enumerate() {
             execute!(
@@ -796,8 +814,7 @@ impl BlockchainStorage {
                 &txn.transaction_hash(),
                 &block.block_hash,
                 &(index as i64)
-            )
-            .map_err(report_integrity)?;
+            )?;
         }
         if query_row!(t, "SELECT count(*) FROM unauthorized_spending JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ?",
                       &block.block_hash; r: i64; r > 0)?
@@ -817,76 +834,114 @@ impl BlockchainStorage {
             err("Transaction(s) in block are not consistent with ancestor blocks; one or more transactions either refer to a nonexistent parent or double spend a previously spent parent")?;
         }
 
-        t.commit().map_err(report_integrity)?;
+        t.commit()?;
         Ok(())
     }
 
     fn receive_tentative_transaction_internal(
-        t: &sql::Transaction, ts: &[&Transaction],
+        t: &impl std::ops::Deref<Target = sql::Connection>, tx: &Transaction,
     ) -> Result<(), BlockchainError> {
-        fn err(msg: &'static str) -> Result<(), BlockchainError> {
-            Err(BlockchainError::InvalidReceivedTentativeTxn(msg, None))
-        }
+        let th = tx.transaction_hash();
 
-        if !ts
-            .iter()
-            .all(|t| 1 <= t.outputs.len() && t.outputs.len() <= 256 && 1 <= t.inputs.len() && t.inputs.len() <= 256)
+        let err = |msg| Err(BlockchainError::InvalidTentativeTxn(Some((th.clone(), msg)).into_iter().collect()));
+
+        BlockchainStorage::insert_transaction_raw(t, tx).map_err(|e| match e {
+            BlockchainError::InvalidTxn(msg) =>
+                BlockchainError::InvalidTentativeTxn(Some((th.clone(), msg)).into_iter().collect()),
+            oe => oe,
+        })?;
+
+        if query_row!(t, "SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?", &th; r: i64; r > 0)? {
+            err("The tentative transaction contain unauthorized spending")?;
+        }
+        if query_row!(t, "SELECT count(*) FROM transaction_credit_debit WHERE transaction_hash = ? AND debited_amount > credited_amount", &th; r: i64; r > 0)?
         {
-            err("Tentative transaction(s) must each have at least one input and one output, and at most 256")?;
+            err("The tentative transaction has an input that spends more than the amount in the referenced output")?;
         }
 
-        if !ts.iter().all(|t| t.outputs.iter().all(|o| o.amount <= Amount::MAX_MONEY)) {
-            err("Every output of every tentative transaction must have a value of no more than 100 billion")?;
-        }
-
-        if !ts.iter().all(|t| {
-            t.outputs.len()
-                == t.outputs.iter().map(|o| &o.recipient_hash).collect::<std::collections::HashSet<_>>().len()
-        }) {
-            err("Tentative transaction(s) must each have distinct output recipients")?;
-        }
-
-        if !ts.iter().all(|t| t.verify_signature()) {
-            err("Tentative transaction(s) must be correctly signed")?;
-        }
-
-        for tx in ts {
-            BlockchainStorage::insert_transaction_raw(t, tx)?;
-            let th = tx.transaction_hash();
-            if query_row!(t, "SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?", &th; r: i64; r > 0)?
-            {
-                err("Tentative transaction(s) contain unauthorized spending")?;
-            }
-            if query_row!(t, "SELECT count(*) FROM transaction_credit_debit WHERE transaction_hash = ? AND debited_amount > credited_amount", &th; r: i64; r > 0)?
-            {
-                err(
-                    "Tentative transaction(s) have an input that spends more than the amount in the referenced output",
-                )?;
-            }
-        }
         Ok(())
     }
 
-    pub fn receive_tentative_transaction(self: &mut Self, ts: &[&Transaction]) -> Result<(), BlockchainError> {
-        fn report_integrity(e: sql::Error) -> BlockchainError {
-            if let sql::Error::SqliteFailure(
-                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, extended_code: ec },
-                _,
-            ) = e
-            {
-                BlockchainError::InvalidReceivedTentativeTxn(
-                    "Tentative transaction(s) do not abide by all rules",
-                    Some(libsqlite3_sys::code_to_str(ec)),
-                )
-            } else {
-                BlockchainError::DatabaseError(e)
+    pub fn receive_tentative_transaction(self: &mut Self, tx: &Transaction) -> Result<(), BlockchainError> {
+        let th = tx.transaction_hash();
+        let tx_serialized = bincode::serialize(tx).unwrap();
+
+        let err = |msg| Err(BlockchainError::InvalidTentativeTxn(Some((th.clone(), msg)).into_iter().collect()));
+
+        if !(1 <= tx.outputs.len() && tx.outputs.len() <= 256 && 1 <= tx.inputs.len() && tx.inputs.len() <= 256) {
+            err("The tentative transaction must have at least one input and one output, and at most 256")?;
+        }
+
+        if !(tx.outputs.iter().all(|o| o.amount <= Amount::MAX_MONEY)) {
+            err("Every output of the tentative transaction must have a value of no more than 100 billion")?;
+        }
+
+        if tx.outputs.len()
+            != tx.outputs.iter().map(|o| &o.recipient_hash).collect::<std::collections::HashSet<_>>().len()
+        {
+            err("The tentative transaction must have distinct output recipients")?;
+        }
+
+        if !tx.verify_signature() {
+            err("The tentative transaction must be correctly signed")?;
+        }
+
+        let mut t = self.conn.transaction()?;
+
+        // We assume pessimistically that the transaction is orphaned. Later we will (and indeed have to) check this.
+        let row_count = execute!(t, "INSERT INTO orphaned_transactions VALUES (?,?)", &th, &tx_serialized)?;
+        if row_count > 0 {
+            for dep in tx.inputs.iter().map(|i| &i.transaction_hash) {
+                execute!(t, "INSERT INTO orphaned_transactions_missing_deps VALUES (?,?)", &th, dep)?;
             }
         }
 
-        let t = self.conn.transaction()?;
-        BlockchainStorage::receive_tentative_transaction_internal(&t, ts)?;
-        t.commit().map_err(report_integrity)?;
+        BlockchainStorage::collect_orphaned_transactions(&mut t)?;
+        t.commit()?;
         Ok(())
+    }
+
+    fn collect_orphaned_transactions(t: &mut sql::Transaction) -> Result<(), BlockchainError> {
+        let mut rejected_orphans = std::collections::HashMap::new();
+        loop {
+            let mut progress = false;
+            // Remove all inaccurate dependencies.
+            if execute!(t, "DELETE FROM orphaned_transactions_missing_deps WHERE dependency IN (SELECT transaction_hash FROM transactions)")? == 0 {
+                break;
+            }
+
+            // Find newly de-orphaned transactions
+            let adopted = query_vec!(t,
+                           "SELECT transaction_hash, transaction_blob FROM orphaned_transactions WHERE transaction_hash NOT IN (SELECT transaction_hash FROM orphaned_transactions_missing_deps)";
+                           th: Hash, ts: Vec<u8>;
+                           (th, bincode::deserialize(&ts[..]).unwrap()))?;
+            for (th, tx) in adopted.into_iter() {
+                execute!(t, "DELETE FROM orphaned_transactions WHERE transaction_hash = ?", &th)?;
+                let mut sp = t.savepoint()?;
+                match BlockchainStorage::receive_tentative_transaction_internal(&sp, &tx) {
+                    Ok(()) => {
+                        sp.commit()?;
+                        progress = true;
+                    }
+                    Err(BlockchainError::InvalidTentativeTxn(e)) => {
+                        sp.rollback()?;
+                        rejected_orphans.extend(e.into_iter());
+                    }
+                    e @ Err(BlockchainError::DatabaseError(_)) => {
+                        return e;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        if rejected_orphans.is_empty() {
+            Ok(())
+        } else {
+            Err(BlockchainError::InvalidTentativeTxn(rejected_orphans))
+        }
     }
 
     fn find_available_spend(
@@ -959,7 +1014,7 @@ impl BlockchainStorage {
                     vec![TransactionOutput { amount: total_amount, recipient_hash: recipient_hash.clone() }]
                 };
                 let txn = wallet.create_raw_transaction(inputs, outputs);
-                BlockchainStorage::receive_tentative_transaction_internal(&t, &[&txn])?;
+                BlockchainStorage::receive_tentative_transaction_internal(&t, &txn)?;
                 t.commit()?;
                 Ok(txn)
             }
@@ -1264,7 +1319,7 @@ mod tests {
         assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0);
 
         // bs2 can receive this transaction
-        bs2.receive_tentative_transaction(&[&tx]).unwrap();
+        bs2.receive_tentative_transaction(&tx).unwrap();
 
         // From bs2's perspective, w1 has no more money left because the reward has been spent, but the change is unconfirmed.
         assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), 0);
@@ -1289,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn cannot_accept_orphaned_tentative_txns() {
+    fn can_accept_orphaned_tentative_txns() {
         let w1 = Wallet::new();
         let mut bs1 = BlockchainStorage::new(None, Some(&w1));
         let w2 = Wallet::new();
@@ -1308,12 +1363,16 @@ mod tests {
         assert_eq!(tx2.inputs.len(), 1);
         assert_eq!(tx2.inputs[0].transaction_hash, tx1.transaction_hash());
 
-        // bs2 cannot receive just the second, now orphaned txn
-        // TODO needs fix
-        assert!(bs2.receive_tentative_transaction(&[&tx2]).is_err());
+        // bs2 can receive them out of order
+        bs2.receive_tentative_transaction(&tx2).unwrap();
+        bs2.receive_tentative_transaction(&tx1).unwrap();
 
-        // bs2 can receive both
-        bs2.receive_tentative_transaction(&[&tx1, &tx2]).unwrap();
+        // Both have a consistent view, if bs2 trusts unconfirmed transactions from bs1
+        bs2.make_wallet_trustworthy(&w1.public_hash).unwrap();
+        assert_eq!(bs1.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0 - 12345 - 23456);
+        assert_eq!(bs2.find_wallet_balance(w1.public_key_hash(), 0).unwrap(), Amount::BLOCK_REWARD.0 - 12345 - 23456);
+        assert_eq!(bs1.find_wallet_balance(w2.public_key_hash(), 0).unwrap(), 12345 + 23456);
+        assert_eq!(bs2.find_wallet_balance(w2.public_key_hash(), 0).unwrap(), 12345 + 23456);
     }
 
     #[test]
@@ -1337,9 +1396,10 @@ mod tests {
         let tx2 = bs1b.create_simple_transaction(None, Amount(23456), w3.public_key_hash()).unwrap();
 
         // All of them can accept the tentative transactions successfully.
-        bs1b.receive_tentative_transaction(&[&tx1]).unwrap();
-        bs1a.receive_tentative_transaction(&[&tx2]).unwrap();
-        bs2.receive_tentative_transaction(&[&tx1, &tx2]).unwrap();
+        bs1b.receive_tentative_transaction(&tx1).unwrap();
+        bs1a.receive_tentative_transaction(&tx2).unwrap();
+        bs2.receive_tentative_transaction(&tx1).unwrap();
+        bs2.receive_tentative_transaction(&tx2).unwrap();
 
         // They have different views of w1's balance, none of which are totally
         // correct: bs1a and bs1b trust their own wallets, so they counted both
