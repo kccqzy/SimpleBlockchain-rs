@@ -8,8 +8,7 @@ edition = "2018"
 
 [dependencies]
 openssl = "0.10"
-serde = "1.0.104"
-serde_derive = "1.0.104"
+serde = { version = "1.0.104", features = ["derive"] }
 bincode = "1.2.1"
 expanduser = "1.2.1"
 rusqlite = "0.21.0"

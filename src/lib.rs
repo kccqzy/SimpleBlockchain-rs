@@ -6,7 +6,7 @@ use openssl::{
 };
 use rusqlite as sql;
 use rusqlite::OptionalExtension;
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Write},
