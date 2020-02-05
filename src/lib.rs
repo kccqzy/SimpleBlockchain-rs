@@ -81,11 +81,11 @@ pub struct BlockchainStats {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum BlockchainError {
+pub enum BlockchainError { // TODO make this an open union for clarity
     DatabaseError(sql::Error),
-    InvalidReceivedBlock(&'static str, Option<&'static str>),
-    InvalidReceivedTentativeTxn(&'static str, Option<&'static str>),
-    InvalidOrphanedTentativeTxn(std::collections::HashMap<Hash, (&'static str, Option<&'static str>)>),
+    InvalidTxn(&'static str),
+    InvalidReceivedBlock(&'static str),
+    InvalidTentativeTxn(std::collections::HashMap<Hash, &'static str>),
     InsufficientBalance { requested_amount: Amount, available_amount: Amount },
     MonetaryAmountTooLarge(),
 }
@@ -698,7 +698,19 @@ impl BlockchainStorage {
 
     fn insert_transaction_raw(
         t: &impl std::ops::Deref<Target = sql::Connection>, txn: &Transaction,
-    ) -> sql::Result<()> {
+    ) -> Result<(), BlockchainError> {
+        fn report_integrity(e: sql::Error) -> BlockchainError {
+            if let sql::Error::SqliteFailure(
+                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, extended_code: ec },
+                _,
+            ) = e
+            {
+                BlockchainError::InvalidTxn(libsqlite3_sys::code_to_str(ec))
+            } else {
+                BlockchainError::DatabaseError(e)
+            }
+        }
+
         let txn_hash = txn.transaction_hash();
         let row_count = execute!(
             t,
@@ -707,7 +719,8 @@ impl BlockchainStorage {
             &txn.payer,
             &Hash::sha256(&txn.payer.0),
             &txn.signature
-        )?;
+        )
+        .map_err(report_integrity)?;
         if row_count > 0 {
             for (index, out) in txn.outputs.iter().enumerate() {
                 execute!(
@@ -717,7 +730,8 @@ impl BlockchainStorage {
                     &(index as i64),
                     &out.amount,
                     &out.recipient_hash
-                )?;
+                )
+                .map_err(report_integrity)?;
             }
             for (index, inp) in txn.inputs.iter().enumerate() {
                 execute!(
@@ -727,31 +741,15 @@ impl BlockchainStorage {
                     &(index as i64),
                     &inp.transaction_hash,
                     &inp.output_index
-                )?;
+                )
+                .map_err(report_integrity)?;
             }
         }
         Ok(())
     }
 
     pub fn receive_block(self: &mut Self, block: &Block) -> Result<(), BlockchainError> {
-        fn err(msg: &'static str) -> Result<(), BlockchainError> {
-            Err(BlockchainError::InvalidReceivedBlock(msg, None))
-        }
-
-        fn report_integrity(e: sql::Error) -> BlockchainError {
-            if let sql::Error::SqliteFailure(
-                libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, extended_code: ec },
-                _,
-            ) = e
-            {
-                BlockchainError::InvalidReceivedBlock(
-                    "Block contains transactions that do not abide by all rules",
-                    Some(libsqlite3_sys::code_to_str(ec)),
-                )
-            } else {
-                BlockchainError::DatabaseError(e)
-            }
-        }
+        fn err(msg: &'static str) -> Result<(), BlockchainError> { Err(BlockchainError::InvalidReceivedBlock(msg)) }
 
         if block.transactions.len() > 2000 {
             err("A block may have at most 2000 transactions")?;
@@ -804,10 +802,9 @@ impl BlockchainStorage {
             &block.block_hash,
             &block.parent_hash,
             &(block.nonce as i64)
-        )
-        .map_err(report_integrity)?;
+        )?;
         for txn in block.transactions.iter() {
-            BlockchainStorage::insert_transaction_raw(&t, &txn).map_err(report_integrity)?;
+            BlockchainStorage::insert_transaction_raw(&t, &txn)?;
         }
         for (index, txn) in block.transactions.iter().enumerate() {
             execute!(
@@ -816,8 +813,7 @@ impl BlockchainStorage {
                 &txn.transaction_hash(),
                 &block.block_hash,
                 &(index as i64)
-            )
-            .map_err(report_integrity)?;
+            )?;
         }
         if query_row!(t, "SELECT count(*) FROM unauthorized_spending JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ?",
                       &block.block_hash; r: i64; r > 0)?
@@ -837,19 +833,23 @@ impl BlockchainStorage {
             err("Transaction(s) in block are not consistent with ancestor blocks; one or more transactions either refer to a nonexistent parent or double spend a previously spent parent")?;
         }
 
-        t.commit().map_err(report_integrity)?;
+        t.commit()?;
         Ok(())
     }
 
     fn receive_tentative_transaction_internal(
         t: &impl std::ops::Deref<Target = sql::Connection>, tx: &Transaction,
     ) -> Result<(), BlockchainError> {
-        fn err(msg: &'static str) -> Result<(), BlockchainError> {
-            Err(BlockchainError::InvalidReceivedTentativeTxn(msg, None))
-        }
-
-        BlockchainStorage::insert_transaction_raw(t, tx)?;
         let th = tx.transaction_hash();
+
+        let err = |msg| Err(BlockchainError::InvalidTentativeTxn(Some((th.clone(), msg)).into_iter().collect()));
+
+        BlockchainStorage::insert_transaction_raw(t, tx).map_err(|e| match e {
+            BlockchainError::InvalidTxn(msg) =>
+                BlockchainError::InvalidTentativeTxn(Some((th.clone(), msg)).into_iter().collect()),
+            oe => oe,
+        })?;
+
         if query_row!(t, "SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?", &th; r: i64; r > 0)? {
             err("The tentative transaction contain unauthorized spending")?;
         }
@@ -862,9 +862,10 @@ impl BlockchainStorage {
     }
 
     pub fn receive_tentative_transaction(self: &mut Self, tx: &Transaction) -> Result<(), BlockchainError> {
-        fn err(msg: &'static str) -> Result<(), BlockchainError> {
-            Err(BlockchainError::InvalidReceivedTentativeTxn(msg, None))
-        }
+        let th = tx.transaction_hash();
+        let tx_serialized = bincode::serialize(tx).unwrap();
+
+        let err = |msg| Err(BlockchainError::InvalidTentativeTxn(Some((th.clone(), msg)).into_iter().collect()));
 
         if !(1 <= tx.outputs.len() && tx.outputs.len() <= 256 && 1 <= tx.inputs.len() && tx.inputs.len() <= 256) {
             err("The tentative transaction must have at least one input and one output, and at most 256")?;
@@ -883,9 +884,6 @@ impl BlockchainStorage {
         if !tx.verify_signature() {
             err("The tentative transaction must be correctly signed")?;
         }
-
-        let th = tx.transaction_hash();
-        let tx_serialized = bincode::serialize(tx).unwrap();
 
         let mut t = self.conn.transaction()?;
 
@@ -924,9 +922,9 @@ impl BlockchainStorage {
                         sp.commit()?;
                         progress = true;
                     }
-                    Err(BlockchainError::InvalidReceivedTentativeTxn(a, b)) => {
+                    Err(BlockchainError::InvalidTentativeTxn(e)) => {
                         sp.rollback()?;
-                        rejected_orphans.insert(th, (a, b));
+                        rejected_orphans.extend(e.into_iter());
                     }
                     e @ Err(BlockchainError::DatabaseError(_)) => {
                         return e;
@@ -941,7 +939,7 @@ impl BlockchainStorage {
         if rejected_orphans.is_empty() {
             Ok(())
         } else {
-            Err(BlockchainError::InvalidOrphanedTentativeTxn(rejected_orphans))
+            Err(BlockchainError::InvalidTentativeTxn(rejected_orphans))
         }
     }
 
