@@ -44,12 +44,13 @@ pub struct TransactionOutput {
     recipient_hash: Hash,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Transaction {
     payer: PayerPublicKey,
     inputs: Vec<TransactionInput>,
     outputs: Vec<TransactionOutput>,
     signature: Signature,
+    transaction_hash: Hash,
 }
 
 #[derive(Debug, Clone)]
@@ -243,12 +244,17 @@ impl sql::types::FromSql for Signature {
 }
 
 impl Transaction {
+    fn recalc_hash(self: &mut Self) {
+        let transaction_hash = Hash::sha256(self.signature.0.as_slice());
+        self.transaction_hash = transaction_hash;
+    }
+
     fn to_signature_data(self: &Self) -> Vec<u8> {
         let content = (&self.payer, &self.inputs, &self.outputs);
         bincode::serialize(&content).unwrap()
     }
 
-    fn transaction_hash(self: &Self) -> Hash { Hash::sha256(self.signature.0.as_slice()) }
+    pub fn transaction_hash(self: &Self) -> &Hash { &self.transaction_hash }
 
     pub fn verify_signature(self: &Self) -> bool {
         fn verify(t: &Transaction) -> Result<bool, openssl::error::ErrorStack> {
@@ -258,6 +264,22 @@ impl Transaction {
             sig.verify(&sha256(t.to_signature_data().as_slice()), &eckey)
         }
         self.payer.check_len() && verify(self).unwrap_or(false)
+    }
+}
+
+impl serde::Serialize for Transaction {
+    fn serialize<S: serde::Serializer>(self: &Self, se: S) -> Result<S::Ok, S::Error> {
+        (&self.payer, &self.inputs, &self.outputs, &self.signature).serialize(se)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Transaction {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        type Inner = (PayerPublicKey, Vec<TransactionInput>, Vec<TransactionOutput>, Signature);
+        Inner::deserialize(de).map(|(payer, inputs, outputs, signature)| {
+            let transaction_hash = Hash::sha256(signature.0.as_slice());
+            Transaction { payer, inputs, outputs, signature, transaction_hash }
+        })
     }
 }
 
@@ -290,13 +312,19 @@ impl Wallet {
     ) -> Transaction {
         assert!(inputs.len() < 256);
         assert!(outputs.len() < 256);
-        let mut txn =
-            Transaction { payer: self.public_serialized.clone(), inputs, outputs, signature: Signature(vec![]) };
+        let mut txn = Transaction {
+            payer: self.public_serialized.clone(),
+            inputs,
+            outputs,
+            signature: Signature(vec![]),
+            transaction_hash: Hash::zeroes(),
+        };
         let sig =
             openssl::ecdsa::EcdsaSig::sign(&sha256(txn.to_signature_data().as_slice()), &self.private_key).unwrap();
         let sig_der = sig.to_der().unwrap();
         txn.signature = Signature(sig_der);
         assert!(txn.verify_signature(), "newly created signature should be verified");
+        txn.recalc_hash();
         txn
     }
 
@@ -1026,13 +1054,14 @@ impl BlockchainStorage {
             .into_iter())
     }
 
-    fn fill_transaction_in_out(t: &sql::Transaction, tx: Transaction) -> sql::Result<Transaction> {
-        let th = tx.transaction_hash();
+    fn fill_transaction_in_out(
+        t: &sql::Transaction, th: Hash, payer: PayerPublicKey, signature: Signature,
+    ) -> sql::Result<Transaction> {
         let inputs = query_vec!(t, "SELECT out_transaction_hash, out_transaction_index FROM transaction_inputs WHERE in_transaction_hash = ? ORDER BY in_transaction_index", &th;
                                 transaction_hash: Hash, output_index: u16; TransactionInput{transaction_hash, output_index})?;
         let outputs = query_vec!(t, "SELECT amount, recipient_hash FROM transaction_outputs WHERE out_transaction_hash = ? ORDER BY out_transaction_index", &th;
                                  amount: Amount, recipient_hash: Hash; TransactionOutput{amount, recipient_hash})?;
-        Ok(Transaction { inputs, outputs, ..tx })
+        Ok(Transaction { inputs, outputs, payer, signature, transaction_hash: th })
     }
 
     pub fn get_block_by_hash(self: &mut Self, block_hash: &Hash) -> sql::Result<Option<Block>> {
@@ -1046,14 +1075,9 @@ impl BlockchainStorage {
         .map_or(Ok(None), |b| {
             Ok(Some(Block {
                 transactions: query_vec!(
-                    t, "SELECT payer, signature FROM transactions JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? ORDER BY transaction_index", block_hash;
-                    payer: PayerPublicKey, signature: Signature;
-                    BlockchainStorage::fill_transaction_in_out(&t, Transaction {
-                        payer,
-                        signature,
-                        inputs: vec![],
-                        outputs: vec![],
-                    })?
+                    t, "SELECT payer, signature, transaction_hash FROM transactions JOIN transaction_in_block USING (transaction_hash) WHERE block_hash = ? ORDER BY transaction_index", block_hash;
+                    p: PayerPublicKey, s: Signature, h: Hash;
+                    BlockchainStorage::fill_transaction_in_out(&t, h, p, s)?
                 )?,
                 ..b
             }))
@@ -1062,14 +1086,9 @@ impl BlockchainStorage {
 
     pub fn get_all_tentative_transactions(self: &mut Self) -> sql::Result<Vec<Transaction>> {
         let t = self.conn.transaction()?;
-        query_vec!(t, "SELECT payer, signature FROM all_tentative_txns";
-                   payer: PayerPublicKey, signature: Signature;
-                   BlockchainStorage::fill_transaction_in_out(&t, Transaction {
-                       payer,
-                       signature,
-                       inputs: vec![],
-                       outputs: vec![],
-                   })?
+        query_vec!(t, "SELECT payer, signature, transaction_hash FROM all_tentative_txns";
+                   p: PayerPublicKey, s: Signature, h: Hash;
+                   BlockchainStorage::fill_transaction_in_out(&t, h, p, s)?
         )
     }
 
@@ -1104,12 +1123,7 @@ impl BlockchainStorage {
                 } else {
                     sp.commit()?;
                     progress = true;
-                    rv.push(BlockchainStorage::fill_transaction_in_out(&t, Transaction {
-                        payer: p,
-                        signature: s,
-                        inputs: vec![],
-                        outputs: vec![],
-                    })?);
+                    rv.push(BlockchainStorage::fill_transaction_in_out(&t, h, p, s)?);
                 }
             }
             if !progress {
@@ -1123,14 +1137,9 @@ impl BlockchainStorage {
 
     pub fn get_ui_transaction_by_hash(self: &mut Self, h: &Hash) -> sql::Result<Option<Vec<(String, String)>>> {
         let t = self.conn.transaction()?; // TODO this ideally would not use a transaction, but a single statement.
-        query_row!(t, "SELECT payer, signature FROM transactions WHERE transaction_hash = ?", h;
-                   payer: PayerPublicKey, signature: Signature;
-                   BlockchainStorage::fill_transaction_in_out(&t, Transaction {
-                       payer,
-                       signature,
-                       inputs: vec![],
-                       outputs: vec![],
-                   })?
+        query_row!(t, "SELECT payer, signature, transaction_hash FROM transactions WHERE transaction_hash = ?", h;
+                   p: PayerPublicKey, s: Signature, h:Hash;
+                   BlockchainStorage::fill_transaction_in_out(&t, h, p, s)?
         ).optional()?
         .map_or(Ok(None), |tx| {
             let mut rv = Vec::new();
@@ -1361,7 +1370,7 @@ mod tests {
         let tx2 = bs1.create_simple_transaction(None, Amount(23456), w2.public_key_hash()).unwrap();
 
         assert_eq!(tx2.inputs.len(), 1);
-        assert_eq!(tx2.inputs[0].transaction_hash, tx1.transaction_hash());
+        assert_eq!(tx2.inputs[0].transaction_hash, *tx1.transaction_hash());
 
         // bs2 can receive them out of order
         bs2.receive_tentative_transaction(&tx2).unwrap();
