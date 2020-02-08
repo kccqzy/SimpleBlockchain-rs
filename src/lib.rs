@@ -703,15 +703,9 @@ impl BlockchainStorage {
         std::mem::replace(&mut self.conn, BlockchainStorage::open_conn(self.path.as_ref().map(|p| p.as_path())));
     }
 
-    pub fn produce_stats(self: &mut Self) -> sql::Result<BlockchainStats> {
-        // Conceptually this shouldn't need to take a mutable reference to self.
-        // But it's just easier to write this way while guaranteeing both stats
-        // are consistent. TODO Maybe refactor.
-        let t = self.conn.transaction()?;
-        Ok(BlockchainStats {
-            block_count: query_row!(t, "SELECT 1 + ifnull((SELECT max(block_height) FROM blocks), -1)"; c: i64; c as u64)?,
-            pending_txn_count: query_row!(t, "SELECT count(*) FROM all_tentative_txns"; c: i64; c as u64)?,
-        })
+    pub fn produce_stats(self: &Self) -> sql::Result<BlockchainStats> {
+        query_row!(self.conn, "SELECT 1 + ifnull((SELECT max(block_height) FROM blocks), -1), (SELECT count(*) FROM all_tentative_txns)";
+                   b: i64, t: i64; BlockchainStats {block_count: b as u64, pending_txn_count: t as u64})
     }
 
     pub fn make_wallet_trustworthy(self: &Self, h: &Hash) -> sql::Result<()> {
@@ -1246,7 +1240,7 @@ mod tests {
 
     #[test]
     fn can_produce_empty_stats() {
-        let mut bs = BlockchainStorage::new(None, None);
+        let bs = BlockchainStorage::new(None, None);
         assert_eq!(bs.produce_stats().unwrap(), BlockchainStats { pending_txn_count: 0, block_count: 0 });
     }
 
