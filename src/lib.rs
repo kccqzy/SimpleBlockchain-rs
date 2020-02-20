@@ -14,9 +14,9 @@ use std::{
 
 // Constants
 
-const WALLET_PATH: &str = "~/.config/rs_simple_blockchain/wallet.pem";
+pub const WALLET_PATH: &str = "~/.config/rs_simple_blockchain/wallet.pem";
 
-const MINIMUM_DIFFICULTY_LEVEL: u8 = 12;
+pub const MINIMUM_DIFFICULTY_LEVEL: u8 = 12;
 
 // Types
 
