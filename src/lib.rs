@@ -11,6 +11,7 @@ use std::{
     fs::File,
     io::{Read, Write},
 };
+use thiserror::Error;
 
 // Constants
 
@@ -81,15 +82,18 @@ pub struct BlockchainStats {
     pub pending_txn_count: u64,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Error, Debug)]
 pub enum BlockchainError {
-    // TODO make this an open union for clarity
-    DatabaseError(sql::Error),
+    #[error("transaction is invalid: {0}")]
     InvalidTxn(&'static str),
+    #[error("received block is invalid: {0}")]
     InvalidReceivedBlock(&'static str),
+    #[error("the tentative transaction is invalid: {0:?}")]
     InvalidTentativeTxn(std::collections::HashMap<Hash, &'static str>),
+    #[error("insufficient balance: requested {requested_amount} has {available_amount}")]
     InsufficientBalance { requested_amount: Amount, available_amount: Amount },
-    MonetaryAmountTooLarge(),
+    #[error("the monetary amount is too large: amount {0} exceeds maximum representable amount {}", Amount::MAX_MONEY.0)]
+    MonetaryAmountTooLarge(u64),
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,7 +120,7 @@ impl std::convert::TryFrom<u64> for Amount {
     type Error = BlockchainError;
     fn try_from(u: u64) -> Result<Amount, BlockchainError> {
         if u > Amount::MAX_MONEY.0 {
-            Err(BlockchainError::MonetaryAmountTooLarge())
+            Err(BlockchainError::MonetaryAmountTooLarge(u))
         } else {
             Ok(Amount(u))
         }
@@ -388,10 +392,6 @@ impl Block {
             }])],
         }
     }
-}
-
-impl std::convert::From<sql::Error> for BlockchainError {
-    fn from(error: sql::Error) -> Self { BlockchainError::DatabaseError(error) }
 }
 
 macro_rules! replace_expr {
@@ -721,16 +721,16 @@ impl BlockchainStorage {
 
     fn insert_transaction_raw(
         t: &impl std::ops::Deref<Target = sql::Connection>, txn: &Transaction,
-    ) -> Result<(), BlockchainError> {
-        fn report_integrity(e: sql::Error) -> BlockchainError {
+    ) -> anyhow::Result<()> {
+        fn report_integrity(e: sql::Error) -> anyhow::Error {
             if let sql::Error::SqliteFailure(
                 libsqlite3_sys::Error { code: libsqlite3_sys::ErrorCode::ConstraintViolation, extended_code: ec },
                 _,
             ) = e
             {
-                BlockchainError::InvalidTxn(libsqlite3_sys::code_to_str(ec))
+                BlockchainError::InvalidTxn(libsqlite3_sys::code_to_str(ec)).into()
             } else {
-                BlockchainError::DatabaseError(e)
+                e.into()
             }
         }
 
@@ -771,7 +771,7 @@ impl BlockchainStorage {
         Ok(())
     }
 
-    pub fn receive_block(self: &mut Self, block: &Block) -> Result<(), BlockchainError> {
+    pub fn receive_block(self: &mut Self, block: &Block) -> anyhow::Result<()> {
         fn err(msg: &'static str) -> Result<(), BlockchainError> { Err(BlockchainError::InvalidReceivedBlock(msg)) }
 
         if block.transactions.len() > 2000 {
@@ -862,15 +862,17 @@ impl BlockchainStorage {
 
     fn receive_tentative_transaction_internal(
         t: &impl std::ops::Deref<Target = sql::Connection>, tx: &Transaction,
-    ) -> Result<(), BlockchainError> {
+    ) -> anyhow::Result<()> {
         let th = tx.transaction_hash();
 
         let err = |msg| Err(BlockchainError::InvalidTentativeTxn(Some((th.clone(), msg)).into_iter().collect()));
 
-        BlockchainStorage::insert_transaction_raw(t, tx).map_err(|e| match e {
-            BlockchainError::InvalidTxn(msg) =>
-                BlockchainError::InvalidTentativeTxn(Some((th.clone(), msg)).into_iter().collect()),
-            oe => oe,
+        BlockchainStorage::insert_transaction_raw(t, tx).map_err(|e| {
+            if let Some(&BlockchainError::InvalidTxn(msg)) = e.downcast_ref::<BlockchainError>() {
+                BlockchainError::InvalidTentativeTxn(Some((th.clone(), msg)).into_iter().collect()).into()
+            } else {
+                e
+            }
         })?;
 
         if query_row!(t, "SELECT count(*) FROM unauthorized_spending WHERE transaction_hash = ?", &th; r: i64; r > 0)? {
@@ -884,7 +886,7 @@ impl BlockchainStorage {
         Ok(())
     }
 
-    pub fn receive_tentative_transaction(self: &mut Self, tx: &Transaction) -> Result<(), BlockchainError> {
+    pub fn receive_tentative_transaction(self: &mut Self, tx: &Transaction) -> anyhow::Result<()> {
         let th = tx.transaction_hash();
         let tx_serialized = bincode::serialize(tx).unwrap();
 
@@ -923,7 +925,7 @@ impl BlockchainStorage {
         Ok(())
     }
 
-    fn collect_orphaned_transactions(t: &mut sql::Transaction) -> Result<(), BlockchainError> {
+    fn collect_orphaned_transactions(t: &mut sql::Transaction) -> anyhow::Result<()> {
         let mut rejected_orphans = std::collections::HashMap::new();
         loop {
             let mut progress = false;
@@ -945,14 +947,15 @@ impl BlockchainStorage {
                         sp.commit()?;
                         progress = true;
                     }
-                    Err(BlockchainError::InvalidTentativeTxn(e)) => {
-                        sp.rollback()?;
-                        rejected_orphans.extend(e.into_iter());
+                    Err(e) => {
+                        let be = e.downcast::<BlockchainError>()?;
+                        if let BlockchainError::InvalidTentativeTxn(e) = be {
+                            sp.rollback()?;
+                            rejected_orphans.extend(e.into_iter());
+                        } else {
+                            return Err(be.into());
+                        }
                     }
-                    e @ Err(BlockchainError::DatabaseError(_)) => {
-                        return e;
-                    }
-                    _ => unreachable!(),
                 }
             }
             if !progress {
@@ -962,7 +965,7 @@ impl BlockchainStorage {
         if rejected_orphans.is_empty() {
             Ok(())
         } else {
-            Err(BlockchainError::InvalidTentativeTxn(rejected_orphans))
+            Err(BlockchainError::InvalidTentativeTxn(rejected_orphans).into())
         }
     }
 
@@ -998,7 +1001,7 @@ impl BlockchainStorage {
 
     pub fn create_simple_transaction(
         self: &mut Self, wallet: Option<&Wallet>, requested_amount: Amount, recipient_hash: &Hash,
-    ) -> Result<Transaction, BlockchainError> {
+    ) -> anyhow::Result<Transaction> {
         let wallet = wallet.unwrap_or(&self.default_wallet);
         let wallet_hash = Hash::sha256(&wallet.public_serialized.0);
 
@@ -1020,7 +1023,7 @@ impl BlockchainStorage {
         );
         match result {
             Ok((_, available_amount)) =>
-                Err(BlockchainError::InsufficientBalance { available_amount, requested_amount }),
+                Err(BlockchainError::InsufficientBalance { available_amount, requested_amount }.into()),
             Err((inputs, total_amount)) => {
                 let outputs = if wallet_hash != *recipient_hash {
                     let mut o =
