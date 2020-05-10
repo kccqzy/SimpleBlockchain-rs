@@ -96,18 +96,6 @@ pub enum BlockchainError {
     MonetaryAmountTooLarge(u64),
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BlockchainMessage {
-    GetLongestChain,
-    ReplyLongestChain(Vec<(Hash, u64)>),
-    GetBlockByHash(Hash),
-    ReplyBlockByHash(Block),
-    GetTentativeTransactions,
-    ReplyTentativeTransactions(Vec<Transaction>),
-    AnnounceNewMinedBlock(Block),
-    AnnounceNewTentativeTransaction(Transaction),
-}
-
 // Impls
 
 impl Amount {

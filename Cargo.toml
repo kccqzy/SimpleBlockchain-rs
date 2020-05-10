@@ -17,5 +17,9 @@ bs58 = "0.3.0"
 thiserror = "1.0.16"
 anyhow = "1.0.28"
 
+[dev-dependencies]
+tokio = { version = "0.2", features = ["full"] }
+bytes = "0.5.4"
+
 [lib]
 path = "src/libblockchain.rs"
