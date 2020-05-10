@@ -700,7 +700,7 @@ impl BlockchainStorage {
         }
 
         // Finally, recreate the database on disk.
-        std::mem::replace(&mut self.conn, BlockchainStorage::open_conn(self.path.as_ref().map(|p| p.as_path())));
+        std::mem::replace(&mut self.conn, BlockchainStorage::open_conn(self.path.as_deref()));
     }
 
     pub fn produce_stats(self: &Self) -> sql::Result<BlockchainStats> {
