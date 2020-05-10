@@ -947,13 +947,14 @@ impl BlockchainStorage {
                         sp.commit()?;
                         progress = true;
                     }
-                    Err(e) => {
-                        let be = e.downcast::<BlockchainError>()?;
-                        if let BlockchainError::InvalidTentativeTxn(e) = be {
+                    Err(mut e) => {
+                        if let Some(&mut BlockchainError::InvalidTentativeTxn(ref mut invalid_tx)) =
+                            e.downcast_mut::<BlockchainError>()
+                        {
                             sp.rollback()?;
-                            rejected_orphans.extend(e.into_iter());
+                            rejected_orphans.extend(invalid_tx.drain());
                         } else {
-                            return Err(be.into());
+                            return Err(e);
                         }
                     }
                 }
